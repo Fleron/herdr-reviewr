@@ -11,8 +11,7 @@
 
 # herdr-reviewr
 
-[![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/persiyanov/herdr-reviewr)](https://github.com/persiyanov/herdr-reviewr/releases/latest)
+[![CI](https://github.com/Fleron/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/Fleron/herdr-reviewr/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/persiyanov/herdr-reviewr)](LICENSE)
 
 <p align="center">
@@ -45,12 +44,13 @@ reviewr never edits your files, never sends on its own, and never posts to your 
 - **herdr ≥ 0.9.3** and **git**.
 - A terminal with **24-bit color**.
 - **macOS, Linux, or Windows.**
+- **Rust**, using the toolchain in `rust-toolchain.toml`, to build this fork during installation.
 - For the PR tab only: **`gh`**, **`glab`**, or **`az`** (with the `azure-devops` extension), logged in.
 
 ## Install
 
 ```bash
-herdr plugin install persiyanov/herdr-reviewr
+herdr plugin install Fleron/herdr-reviewr
 ```
 
 reviewr opens on its own when herdr creates a workspace for a worktree. To open it yourself:
@@ -62,14 +62,17 @@ herdr plugin action invoke open --plugin persiyanov.reviewr
 **To update**, reinstall. Your config stays:
 
 ```bash
-herdr plugin uninstall persiyanov.reviewr && herdr plugin install persiyanov/herdr-reviewr
+herdr plugin install Fleron/herdr-reviewr
 ```
 
-**Without herdr**, run a [release binary](https://github.com/persiyanov/herdr-reviewr/releases/latest)
-on any repo. Everything but **Send** and the **last turn** scope works:
+The plugin builds the checked-out fork with `cargo build --release --locked`. Its ID remains
+`persiyanov.reviewr`, preserving existing keybindings and configuration.
+
+**Without herdr**, run from this checkout against any repo. Everything but **Send** and the
+**last turn** scope works:
 
 ```bash
-herdr-reviewr ~/some/repo
+cargo run --release --locked -- ~/some/repo
 ```
 
 ## Quick start
@@ -360,7 +363,7 @@ On Windows, point it at the plugin's own `bin` folder.
 See [CONTRIBUTING.md](CONTRIBUTING.md). To run your build in herdr:
 
 ```bash
-git clone https://github.com/persiyanov/herdr-reviewr
+git clone https://github.com/Fleron/herdr-reviewr
 cd herdr-reviewr
 just install   # build to bin/herdr-reviewr, re-signed on macOS
 herdr plugin uninstall persiyanov.reviewr

@@ -81,7 +81,7 @@ just qa-restore
 
 It swaps the release binary back through a fresh inode and restores the release manifest.
 Then close and reopen the panes, same as any other swap. A full reinstall
-(`herdr plugin install persiyanov/herdr-reviewr`) also restores the released binary.
+(`herdr plugin install Fleron/herdr-reviewr`) rebuilds the installed fork.
 
 ## Windows
 

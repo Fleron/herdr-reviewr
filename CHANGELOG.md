@@ -6,6 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Fork plugin installs build the checked-out source** with the lockfile, preserving the existing plugin ID and keybindings. Installation requires Rust.
+
 ## [0.52.1] — 2026-11-08
 
 ### Changed
