@@ -400,6 +400,7 @@ pub enum Mode {
     CommitPick,
     /// Choosing the worktree to switch the pane to.
     WorktreePick,
+    PrPick,
     /// The search screen, replacing the body.
     Search,
     /// The read pane's foot band: find in the file, or a line to jump to.
@@ -417,6 +418,7 @@ impl Mode {
                 | Mode::BasePick
                 | Mode::CommitPick
                 | Mode::WorktreePick
+                | Mode::PrPick
         )
     }
 }
@@ -650,6 +652,9 @@ pub enum FooterAction {
     /// The scopes other than the one showing.
     ScopeOther,
     OpenPr,
+    SelectPr,
+    UpdatePr,
+    PickPrRow,
     Refresh,
     Tabs,
     Quit,
@@ -683,11 +688,101 @@ struct LastClick {
     surface: crate::selection::Surface,
 }
 
-/// The full state of the review session.
-// The bools are independent toggles, not a hidden state machine.
+#[derive(Clone, Debug)]
+pub struct PrTarget {
+    pub repository: git::RepoTarget,
+    pub number: u64,
+    pub url: String,
+    pub revision: git::PrRevision,
+}
+
+#[derive(Debug, Default)]
+pub struct PrPicker {
+    pub query: String,
+    pub caret: usize,
+    pub cursor: usize,
+    pub repository: Option<git::RepoTarget>,
+    pub rows: Vec<forge::PrSummary>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub busy: bool,
+}
+
+impl PrPicker {
+    pub fn visible(&self) -> Vec<usize> {
+        let query = self.query.trim().to_lowercase();
+        let number = query.strip_prefix('#').or_else(|| query.strip_prefix('!')).unwrap_or(&query);
+        if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
+            let number = number.parse::<u64>().ok();
+            return self
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| (Some(row.number) == number).then_some(i))
+                .collect();
+        }
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                (query.is_empty()
+                    || format!("#{} {} {}", row.number, row.title, row.head_ref)
+                        .to_lowercase()
+                        .contains(&query))
+                .then_some(i)
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PrTargetAction {
+    List,
+    Open(String),
+    Refresh,
+    Update,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrTargetRequest {
+    pub generation: u64,
+    pub action: PrTargetAction,
+    pub repository: Option<git::RepoTarget>,
+    pub number: Option<u64>,
+    pub changes: crate::world::WorldInput,
+    pub files: crate::world::WorldInput,
+}
+
+pub(crate) enum PrTargetResult {
+    List(git::RepoTarget, Vec<forge::PrSummary>),
+    Open(
+        Box<forge::PreparedPr>,
+        Box<crate::world::WorldSnapshot>,
+        Box<crate::world::WorldSnapshot>,
+    ),
+    Refresh(forge::PrDetails),
+}
+
+#[derive(Debug)]
+struct LocalReview {
+    active: TabStash,
+    stash: TabStash,
+    active_file_tab: Tab,
+    changeset: Changeset,
+    pr: forge::PrView,
+    read_checkout: Option<String>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
+    pub pr_target: Option<PrTarget>,
+    pub pr_picker: Option<PrPicker>,
+    pub pr_newer: Option<(String, String)>,
+    pub(crate) pr_target_request: Option<PrTargetRequest>,
+    pub(crate) pr_target_generation: u64,
+    pr_target_busy: bool,
+    local_review: Option<LocalReview>,
     pub repo: PathBuf,
     pub base: Option<String>,
     /// The `branch` scope's base, from the latest landed snapshot.
@@ -951,6 +1046,13 @@ impl App {
             pick_status: None,
             commit_picker: None,
             base_epoch: 0,
+            pr_target: None,
+            pr_picker: None,
+            pr_newer: None,
+            pr_target_request: None,
+            pr_target_generation: 0,
+            pr_target_busy: false,
+            local_review: None,
             scope,
             tab: Tab::Changes,
             active_file_tab: Tab::Changes,
@@ -1160,6 +1262,17 @@ impl App {
 
     /// Carry the review into a recovered app: comments, and a draft with its frozen diff.
     pub(crate) fn carry_authored_state_from(&mut self, old: &mut Self) {
+        self.pr_target = old.pr_target.take();
+        self.pr_newer = old.pr_newer.take();
+        self.local_review = old.local_review.take();
+        self.pr_target_generation = old.pr_target_generation.wrapping_add(1);
+        self.pr_picker = old.pr_picker.take();
+        if let Some(picker) = &mut self.pr_picker {
+            picker.busy = false;
+            picker.loading = false;
+            picker.error = Some("Configuration changed. Press Enter to retry.".into());
+        }
+
         self.store = std::mem::take(&mut old.store);
         self.list_cursor = old.list_cursor;
         self.carry_pane_from(old);
@@ -1172,11 +1285,15 @@ impl App {
             std::mem::replace(&mut old.herdr, HerdrView::new(crate::turn::LastTurn::default()));
         // A pending refresh survives, or a carried stale frame waits for the next refresh.
         self.world_request = old.world_request.take();
-        let old_mode = old.mode.clone();
+        let old_mode = if self.pr_target.is_some() { Mode::PrPick } else { old.mode.clone() };
         match old_mode {
             // `set_config_error` already closed these.
             Mode::Normal | Mode::Search | Mode::Find | Mode::Picker | Mode::WorktreePick => {}
-            Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
+            Mode::List
+            | Mode::Composing { .. }
+            | Mode::BasePick
+            | Mode::CommitPick
+            | Mode::PrPick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -1192,6 +1309,9 @@ impl App {
                 self.branch_base = std::mem::take(&mut old.branch_base);
                 self.checkout = old.checkout.take();
                 self.pick_status = old.pick_status.take();
+                self.pr = old.pr.clone();
+                self.pr_notice.clone_from(&old.pr_notice);
+                self.read_checkout.clone_from(&old.read_checkout);
                 self.diff = std::mem::take(&mut old.diff);
                 self.visible = std::mem::take(&mut old.visible);
                 self.expanded_folds = std::mem::take(&mut old.expanded_folds);
@@ -1341,16 +1461,256 @@ impl App {
     }
 
     /// The input the next world build reads, and the tag its snapshot must match.
+    pub fn open_pr_picker(&mut self) {
+        if self.composing() || self.tab != Tab::Pr {
+            return;
+        }
+        self.pr_picker = Some(PrPicker::default());
+        self.mode = Mode::PrPick;
+        self.queue_pr_target(PrTargetAction::List);
+    }
+
+    pub fn close_pr_picker(&mut self) {
+        self.pr_target_generation = self.pr_target_generation.wrapping_add(1);
+        self.pr_target_request = None;
+        self.pr_target_busy = false;
+        self.pr_refreshing = false;
+        self.pr_picker = None;
+        self.mode = Mode::Normal;
+    }
+
+    pub fn pr_picker_move(&mut self, delta: isize) {
+        if let Some(picker) = &mut self.pr_picker {
+            picker.cursor = picker
+                .cursor
+                .saturating_add_signed(delta)
+                .min(picker.visible().len().saturating_sub(1));
+        }
+    }
+
+    pub fn submit_pr_picker(&mut self) {
+        let Some(picker) = &self.pr_picker else { return };
+        let query = picker.query.trim();
+        let direct = query.starts_with(['#', '!'])
+            || query.contains("://")
+            || query.chars().all(|c| c.is_ascii_digit());
+        let input = if direct && !query.is_empty() {
+            query.to_string()
+        } else {
+            picker
+                .visible()
+                .get(picker.cursor)
+                .map_or_else(|| query.to_string(), |&i| picker.rows[i].number.to_string())
+        };
+        if input.is_empty() && picker.error.is_some() {
+            self.queue_pr_target(PrTargetAction::List);
+            return;
+        }
+        if input.is_empty() {
+            return;
+        }
+        self.queue_pr_target(PrTargetAction::Open(input));
+    }
+
+    pub fn update_pr_revision(&mut self) {
+        if self.composing() || self.mode != Mode::Normal || self.pr_newer.is_none() {
+            return;
+        }
+        self.queue_pr_target(PrTargetAction::Update);
+    }
+
+    fn queue_pr_target(&mut self, action: PrTargetAction) {
+        self.pr_target_generation = self.pr_target_generation.wrapping_add(1);
+        self.pr_target_busy = true;
+        self.pr_refreshing = false;
+        let mut changes = self.world_input();
+        let mut files = changes.clone();
+        changes.tab = Tab::Changes;
+        files.tab = Tab::AllFiles;
+        if self.active_file_tab == Tab::Changes {
+            files.toggled_dirs.clone_from(&self.stash.toggled_dirs);
+        } else {
+            files.toggled_dirs.clone_from(&self.toggled_dirs);
+        }
+        self.pr_target_request = Some(PrTargetRequest {
+            generation: self.pr_target_generation,
+            action,
+            repository: self
+                .pr_picker
+                .as_ref()
+                .and_then(|p| p.repository.clone())
+                .or_else(|| self.pr_target.as_ref().map(|p| p.repository.clone())),
+            number: self.pr_target.as_ref().map(|p| p.number),
+            changes,
+            files,
+        });
+        if let Some(picker) = &mut self.pr_picker {
+            picker.error = None;
+            picker.loading = false;
+            picker.busy = matches!(
+                self.pr_target_request.as_ref().map(|r| &r.action),
+                Some(PrTargetAction::Open(_))
+            );
+        }
+    }
+
+    pub fn apply_pr_list(&mut self, repository: git::RepoTarget, rows: Vec<forge::PrSummary>) {
+        if let Some(picker) = &mut self.pr_picker {
+            picker.repository = Some(repository);
+            picker.rows = rows;
+            picker.loading = false;
+            picker.cursor = picker.cursor.min(picker.visible().len().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn apply_pr_target_result(
+        &mut self,
+        generation: u64,
+        result: Result<PrTargetResult, String>,
+    ) {
+        if generation != self.pr_target_generation {
+            return;
+        }
+        self.pr_refreshing = false;
+        self.pr_target_busy = false;
+        match result {
+            Ok(PrTargetResult::List(repository, rows)) => self.apply_pr_list(repository, rows),
+            Ok(PrTargetResult::Open(prepared, changes, files)) => {
+                self.install_pr_target(*prepared, *changes, *files);
+            }
+            Ok(PrTargetResult::Refresh(details)) => self.apply_pr_details(details),
+            Err(error) => {
+                self.status.clone_from(&error);
+                if let Some(picker) = &mut self.pr_picker {
+                    picker.loading = false;
+                    picker.busy = false;
+                    picker.error = Some(error);
+                } else {
+                    self.pr_notice = Some(error);
+                }
+            }
+        }
+    }
+
+    pub fn apply_pr_details(&mut self, details: forge::PrDetails) {
+        let Some(target) = &self.pr_target else { return };
+        let current_base = self.pr_snapshot().map_or("", |snapshot| snapshot.base_ref.as_str());
+        if target.revision.head_oid != details.snapshot.head_oid
+            || target.revision.base_oid != details.base_oid
+            || current_base != details.snapshot.base_ref
+        {
+            let short = |oid: &str| git::abbreviate_oid(oid);
+            self.pr_notice = Some(format!(
+                "Reviewing {} vs {} (base {}). Available: {} vs {} (base {}). Checks below belong to the reviewed revision. Use Update revision to load the available revision.",
+                short(&target.revision.head_oid),
+                current_base,
+                short(&target.revision.base_oid),
+                short(&details.snapshot.head_oid),
+                details.snapshot.base_ref,
+                short(&details.base_oid),
+            ));
+            self.pr_newer = Some((details.base_oid, details.snapshot.head_oid));
+        } else {
+            self.pr_newer = None;
+            self.apply_pr(forge::PrView::Pr(Box::new(details.snapshot)));
+        }
+    }
+
+    pub fn install_pr_target(
+        &mut self,
+        prepared: forge::PreparedPr,
+        changes: crate::world::WorldSnapshot,
+        files: crate::world::WorldSnapshot,
+    ) {
+        if self.composing() {
+            return;
+        }
+        if self.local_review.is_none() {
+            let mut active = TabStash::default();
+            self.swap_active_with(&mut active);
+            self.local_review = Some(LocalReview {
+                active,
+                stash: std::mem::take(&mut self.stash),
+                active_file_tab: self.active_file_tab,
+                changeset: std::mem::take(&mut self.changeset),
+                pr: self.pr.clone(),
+                read_checkout: self.read_checkout.clone(),
+            });
+        } else if self.pr_target.as_ref().is_none_or(|target| {
+            target.number != prepared.snapshot.number || target.repository != prepared.repository
+        }) {
+            let mut old = TabStash::default();
+            self.swap_active_with(&mut old);
+            self.stash = TabStash::default();
+        }
+        self.cache = DiffCache::new();
+        self.base_epoch = self.base_epoch.wrapping_add(1);
+        self.world_request = None;
+        self.pr_target = Some(PrTarget {
+            repository: prepared.repository,
+            number: prepared.snapshot.number,
+            url: prepared.snapshot.url.clone(),
+            revision: prepared.revision,
+        });
+        self.pr_pending = None;
+        self.pr_forge = self.pr_target.as_ref().expect("installed target").repository.forge();
+        self.pr_newer = None;
+        self.pr_target_busy = false;
+        self.pr_picker = None;
+        self.mode = Mode::Normal;
+        self.apply_pr(forge::PrView::Pr(Box::new(prepared.snapshot)));
+        let tab = self.tab;
+        let active = self.active_file_tab;
+        let (first, second) =
+            if active == Tab::Changes { (changes, files) } else { (files, changes) };
+        self.tab = active;
+        self.reconcile_world(first);
+        self.swap_active_with_stash();
+        self.active_file_tab = if active == Tab::Changes { Tab::AllFiles } else { Tab::Changes };
+        self.tab = self.active_file_tab;
+        self.reconcile_world(second);
+        self.swap_active_with_stash();
+        self.active_file_tab = active;
+        self.tab = tab;
+        self.status = "PR opened; reviewed revision is pinned".into();
+    }
+
+    fn return_to_local(&mut self) {
+        let Some(mut local) = self.local_review.take() else { return };
+        self.pr_target_generation = self.pr_target_generation.wrapping_add(1);
+        self.pr_target_request = None;
+        self.pr_target_busy = false;
+        self.pr_refreshing = false;
+        self.pr_target = None;
+        self.pr_newer = None;
+        self.pr_notice = None;
+        self.swap_active_with(&mut local.active);
+        self.stash = local.stash;
+        self.active_file_tab = local.active_file_tab;
+        if self.tab.is_file_tab() && self.tab != self.active_file_tab {
+            self.swap_active_with_stash();
+            self.active_file_tab = self.tab;
+        }
+        self.changeset = local.changeset;
+        self.pr = local.pr;
+        self.read_checkout = local.read_checkout;
+        self.cache = DiffCache::new();
+        self.base_epoch = self.base_epoch.wrapping_add(1);
+        self.world_request = None;
+        self.request_pr_refresh(RefreshKind::Forced);
+        self.request_world_refresh(false);
+    }
+
     pub fn world_input(&self) -> crate::world::WorldInput {
         crate::world::WorldInput {
             repo: self.repo.clone(),
-            pr_revision: None,
             tab: self.tab,
             scope: self.scope,
             base: self.base.clone(),
             base_epoch: self.base_epoch,
             turn_baseline: self.herdr.last_turn.tree().map(str::to_string),
             commit_pick: self.commit_pick.clone(),
+            pr_revision: self.pr_target.as_ref().map(|target| target.revision.clone()),
             // `Changes` never reads the toggled set, so a toggle there invalidates nothing.
             toggled_dirs: if self.tab == Tab::AllFiles {
                 self.toggled_dirs.clone()
@@ -1362,14 +1722,14 @@ impl App {
 
     /// Adopt a build's base, which only the `branch` scope owns.
     fn adopt_branch_base(&mut self, base: git::BaseStatus) {
-        if self.scope == Scope::Branch {
+        if self.scope == Scope::Branch && self.pr_target.is_none() {
             self.branch_base = base;
         }
     }
 
     /// Adopt a build's pick verdict, which only the `commits` scope owns.
     fn adopt_pick_status(&mut self, status: Option<PickStatus>) {
-        if self.scope == Scope::Commits {
+        if self.scope == Scope::Commits && self.pr_target.is_none() {
             self.pick_status = status;
         }
     }
@@ -1530,7 +1890,12 @@ impl App {
 
     /// The File view for `path`: the too-large notice unread, else the highlighted worktree content.
     fn file_view(&mut self, path: &str) -> (FileDiff, String) {
-        match worktree_content(&self.repo, path) {
+        let content = match &self.pr_target {
+            Some(target) => git::content_at(&self.repo, &target.revision.head_oid, path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            None => worktree_content(&self.repo, path),
+        };
+        match content {
             Ok(content) => {
                 let diff = self.cache.get_file(path.to_string(), &content, &self.highlighter);
                 (diff, content)
@@ -1934,7 +2299,13 @@ impl App {
             return Err(Notice::TooLarge);
         }
         let source = annotation.previous_path.as_deref();
-        match git::diff_sides(&self.repo, &ends.old, ends.new.as_deref(), path, source) {
+        let sides = match &self.pr_target {
+            Some(target) => {
+                git::diff_sides_at(&self.repo, &ends.old, &target.revision.head_oid, path, source)
+            }
+            None => git::diff_sides(&self.repo, &ends.old, ends.new.as_deref(), path, source),
+        };
+        match sides {
             Ok(git::DiffSides::Text { old, new }) => Ok((old, new)),
             Ok(git::DiffSides::Binary) => Err(Notice::Binary),
             Err(error) => {
@@ -1946,7 +2317,7 @@ impl App {
 
     /// The `commits` scope over a pruned pick.
     pub fn commits_gone(&self) -> bool {
-        self.scope == Scope::Commits && self.pick_gone()
+        self.pr_target.is_none() && self.scope == Scope::Commits && self.pick_gone()
     }
 
     /// Whether the last build found the pick pruned, kept across a scope switch.
@@ -1966,6 +2337,13 @@ impl App {
 
     /// Where the open diff's new side was read.
     fn current_rev(&self) -> Rev {
+        if let Some(target) = &self.pr_target {
+            return Rev::Pr {
+                url: target.url.clone(),
+                base: target.revision.base_oid.clone(),
+                head: target.revision.head_oid.clone(),
+            };
+        }
         match (self.scope, &self.commit_pick) {
             (Scope::Commits, Some(pick)) => Rev::Commit(pick.clone()),
             _ => Rev::Worktree,
@@ -1974,7 +2352,9 @@ impl App {
 
     /// `last-turn` with no baseline captured yet.
     pub fn awaiting_turn(&self) -> bool {
-        self.scope == Scope::LastTurn && self.herdr.last_turn.tree().is_none()
+        self.pr_target.is_none()
+            && self.scope == Scope::LastTurn
+            && self.herdr.last_turn.tree().is_none()
     }
 
     /// The message for an [`Self::awaiting_turn`] frame; "no agent" only once a sample looked.
@@ -2776,6 +3156,9 @@ impl App {
     /// Switch the scope and reload; inert while composing.
     pub fn set_scope(&mut self, scope: Scope) -> Result<()> {
         self.ensure_config_ready()?;
+        if !self.composing() {
+            self.return_to_local();
+        }
         // `commits` without a live pick opens the picker instead of switching.
         if scope == Scope::Commits
             && (self.commit_pick.is_none() || self.pick_gone())
@@ -2827,6 +3210,12 @@ impl App {
 
     /// Queue a PR refresh; the stronger pending kind wins.
     pub fn request_pr_refresh(&mut self, kind: RefreshKind) {
+        if self.pr_target.is_some() {
+            if self.pr_picker.is_none() && !self.pr_target_busy {
+                self.queue_pr_target(PrTargetAction::Refresh);
+            }
+            return;
+        }
         self.pr_pending = self.pr_pending.max(Some(kind));
     }
 
@@ -2902,6 +3291,14 @@ impl App {
         let path = self.diff_path.clone()?;
         // `All files` lists every file on disk; `Changes`, the scope's changeset.
         let listed = match tab {
+            Tab::AllFiles if self.pr_target.is_some() => {
+                let entries = if self.active_file_tab == Tab::AllFiles {
+                    &self.entries
+                } else {
+                    &self.stash.entries
+                };
+                entries.iter().any(|entry| entry.path == path)
+            }
             Tab::AllFiles => self.repo.join(&path).is_file(),
             Tab::Changes => self.changeset.files.contains_key(&path),
             Tab::Pr => false,
@@ -3140,24 +3537,30 @@ impl App {
 
     /// Swap the live per-tab fields with the stash; a field left out bleeds between tabs.
     fn swap_active_with_stash(&mut self) {
-        std::mem::swap(&mut self.entries, &mut self.stash.entries);
-        std::mem::swap(&mut self.file_rows, &mut self.stash.file_rows);
-        std::mem::swap(&mut self.file_cursor, &mut self.stash.file_cursor);
-        std::mem::swap(&mut self.file_scroll, &mut self.stash.file_scroll);
-        std::mem::swap(&mut self.toggled_dirs, &mut self.stash.toggled_dirs);
-        std::mem::swap(&mut self.diff, &mut self.stash.diff);
-        std::mem::swap(&mut self.visible, &mut self.stash.visible);
-        std::mem::swap(self.cursor_line.get_mut(), &mut self.stash.cursor_line);
-        std::mem::swap(&mut self.expanded_folds, &mut self.stash.expanded_folds);
-        std::mem::swap(&mut self.diff_path, &mut self.stash.diff_path);
-        std::mem::swap(&mut self.diff_cursor, &mut self.stash.diff_cursor);
-        std::mem::swap(&mut self.diff_scroll, &mut self.stash.diff_scroll);
-        std::mem::swap(&mut self.h_scroll, &mut self.stash.h_scroll);
-        std::mem::swap(&mut self.select_anchor, &mut self.stash.select_anchor);
-        std::mem::swap(&mut self.rendered, &mut self.stash.rendered);
-        std::mem::swap(&mut self.comment_target, &mut self.stash.comment_target);
-        std::mem::swap(&mut self.checkout, &mut self.stash.checkout);
-        std::mem::swap(&mut self.tab_visited, &mut self.stash.visited);
+        let mut stash = std::mem::take(&mut self.stash);
+        self.swap_active_with(&mut stash);
+        self.stash = stash;
+    }
+
+    fn swap_active_with(&mut self, stash: &mut TabStash) {
+        std::mem::swap(&mut self.entries, &mut stash.entries);
+        std::mem::swap(&mut self.file_rows, &mut stash.file_rows);
+        std::mem::swap(&mut self.file_cursor, &mut stash.file_cursor);
+        std::mem::swap(&mut self.file_scroll, &mut stash.file_scroll);
+        std::mem::swap(&mut self.toggled_dirs, &mut stash.toggled_dirs);
+        std::mem::swap(&mut self.diff, &mut stash.diff);
+        std::mem::swap(&mut self.visible, &mut stash.visible);
+        std::mem::swap(self.cursor_line.get_mut(), &mut stash.cursor_line);
+        std::mem::swap(&mut self.expanded_folds, &mut stash.expanded_folds);
+        std::mem::swap(&mut self.diff_path, &mut stash.diff_path);
+        std::mem::swap(&mut self.diff_cursor, &mut stash.diff_cursor);
+        std::mem::swap(&mut self.diff_scroll, &mut stash.diff_scroll);
+        std::mem::swap(&mut self.h_scroll, &mut stash.h_scroll);
+        std::mem::swap(&mut self.select_anchor, &mut stash.select_anchor);
+        std::mem::swap(&mut self.rendered, &mut stash.rendered);
+        std::mem::swap(&mut self.comment_target, &mut stash.comment_target);
+        std::mem::swap(&mut self.checkout, &mut stash.checkout);
+        std::mem::swap(&mut self.tab_visited, &mut stash.visited);
     }
 
     /// Flip focus; a hidden navigator is shown and focused instead.
@@ -3571,6 +3974,12 @@ impl App {
         })
     }
 
+    pub(crate) fn gates_pr_target_drain(&self) -> bool {
+        !matches!(self.mode, Mode::Normal | Mode::PrPick)
+            || self.gesture_active()
+            || self.divider_drag_captured()
+    }
+
     /// Forget the pointer before another program takes the terminal and its mouse.
     pub(crate) fn forget_pointer(&mut self) {
         self.cancel_gesture();
@@ -3695,6 +4104,12 @@ impl App {
             self.edit_comment();
             return;
         }
+        if self.pr_target.is_some() {
+            self.status =
+                "File editing is available in local review; this file is from the PR head commit."
+                    .into();
+            return;
+        }
         self.editor_request = self.edit_target();
     }
 
@@ -3720,6 +4135,9 @@ impl App {
 
     /// The file and line `edit` opens, for the press and the footer alike; never touches disk.
     fn edit_target(&self) -> Option<EditTarget> {
+        if self.pr_target.is_some() {
+            return None;
+        }
         // `PR` names no file of its own.
         if !self.tab.is_file_tab() {
             return None;
@@ -3812,6 +4230,7 @@ impl App {
             Mode::WorktreePick => {
                 self.worktree_picker.as_mut().map(|w| (&mut w.query, &mut w.caret))
             }
+            Mode::PrPick => self.pr_picker.as_mut().map(|p| (&mut p.query, &mut p.caret)),
             Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick => None,
         }
     }
@@ -3832,6 +4251,20 @@ impl App {
         let edited: String = v.into_iter().collect();
         let changed = *text != edited;
         *text = edited;
+        if changed
+            && self.mode == Mode::PrPick
+            && let Some(picker) = &mut self.pr_picker
+        {
+            picker.cursor = 0;
+            picker.error = None;
+            if picker.busy {
+                picker.busy = false;
+                picker.loading = false;
+                self.pr_target_generation = self.pr_target_generation.wrapping_add(1);
+                self.pr_target_request = None;
+                self.pr_target_busy = false;
+            }
+        }
         if searching && changed {
             self.search_dirty = true;
         }
@@ -3949,7 +4382,7 @@ impl App {
         match self.mode {
             Mode::Search | Mode::Find => norm = norm.replace('\n', " "),
             // No branch or worktree name holds a newline.
-            Mode::BasePick | Mode::WorktreePick => norm.retain(|c| c != '\n'),
+            Mode::BasePick | Mode::WorktreePick | Mode::PrPick => norm.retain(|c| c != '\n'),
             _ => {}
         }
         let norm: Vec<char> = norm.chars().collect();
@@ -4171,7 +4604,11 @@ impl App {
         // A File view comment is content-anchored: it goes stale only with its file.
         let diff_anchored = self.diff.view == View::Diff;
         // A content comment reads the worktree whatever the scope.
-        let rev = if diff_anchored { self.current_rev() } else { Rev::Worktree };
+        let rev = if diff_anchored || self.pr_target.is_some() {
+            self.current_rev()
+        } else {
+            Rev::Worktree
+        };
         Some(Comment { file, side, start, end, lines, text, diff_anchored, rev })
     }
 
@@ -4201,6 +4638,7 @@ impl App {
             | Mode::BasePick
             | Mode::CommitPick
             | Mode::WorktreePick
+            | Mode::PrPick
             | Mode::Search
             | Mode::Find => None,
         }
@@ -4216,11 +4654,15 @@ impl App {
 
     /// Whether the scope reads the diff `c` was made on.
     fn rev_is_current(&self, c: &Comment) -> bool {
+        if self.pr_target.is_some() {
+            return c.rev == self.current_rev();
+        }
         match &c.rev {
             Rev::Worktree => {
                 !c.diff_anchored || self.scope != Scope::Commits || self.commit_pick.is_none()
             }
             Rev::Commit(p) => self.scope == Scope::Commits && self.commit_pick.as_ref() == Some(p),
+            Rev::Pr { .. } => false,
         }
     }
 
@@ -4406,6 +4848,10 @@ impl App {
 
     /// `/`: open the search screen, from any tab, from either pane.
     pub fn open_search(&mut self) {
+        if self.pr_target.is_some() {
+            self.status = "Workspace search is available in local review. Use the file tree or find within the reviewed file.".into();
+            return;
+        }
         // A held navigator-divider drag must not resize the search split.
         self.cancel_divider_drag();
         self.search = Some(SearchOverlay::new());
@@ -4867,6 +5313,9 @@ impl App {
                     (A::MoveMenuRow, Do),
                 ];
             }
+            Mode::PrPick => {
+                return vec![(A::PickPrRow, Primary), (A::ClosePicker, Do), (A::MoveMenuRow, Do)];
+            }
             Mode::CommitPick => {
                 // Nothing listed: only the exit.
                 if self.commit_picker.as_ref().is_none_or(CommitPicker::is_empty) {
@@ -4922,9 +5371,13 @@ impl App {
 
         // `PR`: `o open` for any resolved PR; `move` holds only the steps the tab has.
         if self.tab == Tab::Pr {
-            let mut out = Vec::new();
-            if self.pr_snapshot().is_some() {
-                out.push((A::OpenPr, Primary));
+            let mut out = if self.pr_snapshot().is_some() {
+                vec![(A::OpenPr, Primary), (A::SelectPr, Do)]
+            } else {
+                vec![(A::SelectPr, Primary)]
+            };
+            if self.pr_newer.is_some() {
+                out.push((A::UpdatePr, Do));
             }
             out.push((A::WorktreePick, Go));
             out.push((A::Search, Go));
@@ -5160,6 +5613,9 @@ impl App {
 
     /// Open the base picker on the current base; it opens empty too, so a revision can be typed.
     pub fn open_base_picker(&mut self) {
+        if !self.composing() {
+            self.return_to_local();
+        }
         if !self.base_pick_available() || self.mode != Mode::Normal {
             return;
         }
@@ -5393,6 +5849,9 @@ impl App {
 
     /// Open the commit picker with the current pick highlighted and anchored.
     pub fn open_commit_picker(&mut self) {
+        if !self.composing() {
+            self.return_to_local();
+        }
         if !self.tab.is_file_tab() || self.mode != Mode::Normal {
             return;
         }
@@ -5624,6 +6083,9 @@ impl App {
 
     /// Whether a comment's anchor may have moved: its file left the changeset, or the disk.
     pub fn is_stale(&self, c: &Comment) -> bool {
+        if self.pr_target.is_some() || matches!(c.rev, Rev::Pr { .. }) {
+            return !self.rev_is_current(c);
+        }
         if c.diff_anchored {
             !self.changeset.files.contains_key(&c.file)
         } else {

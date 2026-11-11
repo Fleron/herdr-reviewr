@@ -745,6 +745,10 @@ pub fn land_world_completion(
         let unread = if live.full { crate::world::Refresh::default() } else { completion.refresh };
         return Landing::Superseded(unread);
     }
+    if completion.input != app.world_input() {
+        owed(app);
+        return Landing::Discarded(completion.refresh);
+    }
     match completion.snapshot {
         Some(Ok(snapshot))
             if app.config_error().is_none() && app.world_input() == completion.input =>
@@ -882,6 +886,73 @@ fn glyph_clears(lit_for: Duration) -> bool {
 }
 
 /// Draw, then sleep until input, a worker's result, or the nearest armed deadline.
+fn run_pr_target_request(
+    repo: &std::path::Path,
+    config: &PluginConfig,
+    request: crate::app::PrTargetRequest,
+    cancelled: &AtomicBool,
+) -> Result<crate::app::PrTargetResult, String> {
+    use crate::app::{PrTargetAction, PrTargetResult};
+    let _session = crate::git::lease_session(repo);
+    let target = match request.repository {
+        Some(target) => target,
+        None => match crate::git::remote_identities(
+            repo,
+            &config.forge_hosts(),
+            crate::git::ssh_hostname,
+        )
+        .map_err(|error| error.to_string())?
+        .0
+        {
+            crate::git::RepositoryIdentity::Repository(target) => target,
+            identity => return Err(format!("Cannot open a PR for this repository: {identity:?}")),
+        },
+    };
+    let retry = match &request.action {
+        PrTargetAction::List | PrTargetAction::Open(_) => "Enter".into(),
+        PrTargetAction::Refresh => config.keymap().hint(crate::keymap::Action::Refresh).label(),
+        PrTargetAction::Update => config.keymap().hint(crate::keymap::Action::UpdatePr).label(),
+    };
+    let error = |view: crate::forge::PrView| {
+        view.retry_remedy_label(&retry).unwrap_or_else(|| {
+            ui::pr_empty_msg(
+                &view,
+                target.forge(),
+                config.keymap().hint(crate::keymap::Action::Refresh),
+            )
+        })
+    };
+    match request.action {
+        PrTargetAction::List => crate::forge::list_open_prs(repo, &target, cancelled)
+            .map(|rows| PrTargetResult::List(target.clone(), rows))
+            .map_err(error),
+        PrTargetAction::Refresh => crate::forge::fetch_pr_details(
+            repo,
+            &target,
+            request.number.ok_or("No PR selected")?,
+            cancelled,
+        )
+        .map(PrTargetResult::Refresh)
+        .map_err(error),
+        action => {
+            let number = match action {
+                PrTargetAction::Open(input) => crate::forge::parse_pr_number(&target, &input)?,
+                PrTargetAction::Update => request.number.ok_or("No PR selected")?,
+                _ => unreachable!(),
+            };
+            let prepared =
+                crate::forge::prepare_pr(repo, &target, number, cancelled).map_err(error)?;
+            let mut changes = request.changes;
+            let mut files = request.files;
+            changes.pr_revision = Some(prepared.revision.clone());
+            files.pr_revision = Some(prepared.revision.clone());
+            let changes = crate::world::build(&changes).map_err(|error| error.to_string())?;
+            let files = crate::world::build(&files).map_err(|error| error.to_string())?;
+            Ok(PrTargetResult::Open(Box::new(prepared), Box::new(changes), Box::new(files)))
+        }
+    }
+}
+
 fn event_loop(
     screen: &mut Screen,
     app: &mut App,
@@ -908,6 +979,9 @@ fn event_loop(
     let (recovery_tx, recovery_rx) = crate::wake::channel::<(u64, PluginConfig, App)>(&waker);
     let mut recovery_inflight = false;
     let (pr_tx, pr_rx) = crate::wake::channel::<TaggedPr>(&waker);
+    let (target_tx, target_rx) =
+        crate::wake::channel::<(u64, u64, Result<crate::app::PrTargetResult, String>)>(&waker);
+    let mut target_active: Option<(u64, u64, Arc<AtomicBool>, Instant)> = None;
     let mut pr = PrCoordinator::new(app.plugin_config().is_some());
     // The world worker builds input-tagged jobs; the loop reconciles their completions.
     let (world_tx, world_job_rx) = mpsc::channel::<crate::world::WorldJob>();
@@ -990,6 +1064,53 @@ fn event_loop(
                     &mut recovery_inflight,
                     &mut pr,
                 );
+            }
+            if let Some((generation, epoch, cancelled, started)) = &target_active {
+                if *generation != app.pr_target_generation || *epoch != config_epoch {
+                    cancelled.store(true, Ordering::Release);
+                    target_active = None;
+                } else if started.elapsed() >= INDICATOR_DELAY {
+                    if let Some(picker) = &mut app.pr_picker {
+                        picker.loading = true;
+                    } else {
+                        app.set_pr_refreshing(true);
+                    }
+                }
+            }
+            while !config_dirty
+                && !app.gates_pr_target_drain()
+                && let Ok((generation, epoch, result)) = target_rx.try_recv()
+            {
+                if target_active.as_ref().is_some_and(|active| active.0 == generation) {
+                    target_active = None;
+                }
+                if epoch == config_epoch && app.config_error().is_none() {
+                    app.apply_pr_target_result(generation, result);
+                }
+            }
+            if app.pane_visible()
+                && !config_dirty
+                && app.config_error().is_none()
+                && let Some(request) = app.pr_target_request.take()
+            {
+                if let Some((_, _, cancelled, _)) = target_active.take() {
+                    cancelled.store(true, Ordering::Release);
+                }
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let (generation, epoch) = (request.generation, config_epoch);
+                target_active = Some((generation, epoch, cancelled.clone(), Instant::now()));
+                let (tx, repo, config) = (
+                    target_tx.clone(),
+                    app.repo.clone(),
+                    app.plugin_config().expect("ready config").clone(),
+                );
+                thread::spawn(move || {
+                    let result = run_pr_target_request(&repo, &config, request, &cancelled);
+                    let _ = tx.send((generation, epoch, result));
+                });
+            }
+            if app.pr_target.is_some() {
+                pr.stop();
             }
             if pr.wait_started.is_some_and(|started| started.elapsed() >= INDICATOR_DELAY) {
                 app.set_pr_refreshing(true);
@@ -1212,128 +1333,160 @@ fn event_loop(
                 }
             }
 
-            // Triggers first, so a commanded one supersedes a completion before it paints.
-            // A hidden pane fetches nothing: a trigger waits for it to be shown.
-            let fallback_poll = app.pane_visible()
-                && app.tab == crate::app::Tab::Pr
-                && last_pr_poll.elapsed() >= PR_POLL;
-            let pending = if app.pane_visible() { app.pr_pending.take() } else { None };
-            let refresh = pending.or(fallback_poll.then_some(crate::app::RefreshKind::Ambient));
-            if let Some(kind) = refresh {
-                last_pr_poll = Instant::now();
-                pr.request_refresh(kind);
-            }
-
-            // A fetch waits for a fresh probe; a gesture holds both PR drains.
-            if !app.gates_pr_drain()
-                && let Ok(completion) = pr_rx.try_recv()
-            {
-                let tag = (completion.generation, completion.config_epoch);
-                if pr.active_fetch_tag() != Some(tag) {
-                    continue;
-                }
+            if app.pr_target.is_some() {
+                pr.stop();
                 pr.active_fetch = None;
-                let config_gate = reconcile_plugin_config(
-                    app,
-                    cfg,
-                    area,
-                    &mut config_epoch,
-                    &recovery_tx,
-                    &mut recovery_inflight,
-                    &mut pr,
-                );
-                if config_gate.pr_unchanged() {
-                    pr.refresh.completed(completion, config_epoch, app.tab == crate::app::Tab::Pr);
-                    pr.probe_pending = true;
-                }
-                if config_gate != ConfigGate::Unchanged {
-                    continue;
-                }
-            }
-
-            // The probe is the authority on the current input.
-            if !app.gates_pr_drain()
-                && let Ok((epoch, result)) = probe_rx.try_recv()
-            {
-                if pr.active_probe_epoch != Some(epoch) {
-                    continue;
-                }
                 pr.active_probe_epoch = None;
-                let config_gate = reconcile_plugin_config(
-                    app,
-                    cfg,
-                    area,
-                    &mut config_epoch,
-                    &recovery_tx,
-                    &mut recovery_inflight,
-                    &mut pr,
-                );
-                let mut repaint = false;
-                if !config_gate.pr_unchanged() || epoch != config_epoch {
-                    if config_gate == ConfigGate::Unchanged && epoch != config_epoch {
-                        pr.config_changed(app.tab == crate::app::Tab::Pr);
+                while pr_rx.try_recv().is_ok() {}
+                while probe_rx.try_recv().is_ok() {}
+                app.pr_pending = None;
+                if app.pane_visible()
+                    && app.tab == crate::app::Tab::Pr
+                    && last_pr_poll.elapsed() >= PR_POLL
+                {
+                    last_pr_poll = Instant::now();
+                    app.request_pr_refresh(crate::app::RefreshKind::Ambient);
+                }
+            } else {
+                // Triggers first, so a commanded one supersedes a completion before it paints.
+                // A hidden pane fetches nothing: a trigger waits for it to be shown.
+                let fallback_poll = app.pane_visible()
+                    && app.tab == crate::app::Tab::Pr
+                    && last_pr_poll.elapsed() >= PR_POLL;
+                let pending = if app.pane_visible() { app.pr_pending.take() } else { None };
+                let refresh = pending.or(fallback_poll.then_some(crate::app::RefreshKind::Ambient));
+                if let Some(kind) = refresh {
+                    last_pr_poll = Instant::now();
+                    pr.request_refresh(kind);
+                }
+
+                // A fetch waits for a fresh probe; a gesture holds both PR drains.
+                if !app.gates_pr_drain()
+                    && let Ok(completion) = pr_rx.try_recv()
+                {
+                    let tag = (completion.generation, completion.config_epoch);
+                    if pr.active_fetch_tag() != Some(tag) {
+                        continue;
                     }
-                } else {
-                    repaint = apply_pr_probe_result(app, &mut pr, result, config_epoch);
-                }
-                if config_gate != ConfigGate::Unchanged || repaint {
-                    continue;
-                }
-            }
-
-            if app.pane_visible() && pr.can_start_probe(app.plugin_config().is_some()) {
-                pr.probe_pending = false;
-                let (tx, repo, base, plugin_config, epoch) = (
-                    probe_tx.clone(),
-                    app.repo.clone(),
-                    app.base.clone(),
-                    app.plugin_config().expect("config checked above").clone(),
-                    config_epoch,
-                );
-                let verifies_completion = pr.refresh.pending.is_some();
-                pr.active_probe_epoch = Some(epoch);
-                thread::spawn(move || {
-                    let input = if verifies_completion {
-                        crate::forge::verify_input(&repo, base.as_deref(), &plugin_config)
-                    } else {
-                        crate::forge::fetch_input(&repo, base.as_deref(), &plugin_config)
-                    };
-                    let _ = tx.send((epoch, input));
-                });
-            }
-
-            if app.pane_visible()
-                && pr.active_fetch.is_none()
-                && pr.active_probe_epoch.is_none()
-                && !pr.probe_pending
-                && let Some((generation, input)) = pr.refresh.take_fetch()
-            {
-                let (tx, repo, epoch) = (pr_tx.clone(), app.repo.clone(), config_epoch);
-                let cancelled = Arc::new(AtomicBool::new(false));
-                pr.active_fetch = Some(ActiveFetch {
-                    tag: (generation, epoch),
-                    cancelled: cancelled.clone(),
-                    started: Instant::now(),
-                });
-                let held = match &app.pr {
-                    crate::forge::PrView::Pr(snapshot) => Some(snapshot.head_oid.clone()),
-                    _ => None,
-                };
-                thread::spawn(move || {
-                    let view = crate::forge::fetch_cancellable(&repo, &input, &cancelled);
-                    // On the worker, so the event loop never runs git.
-                    let view = hold_gate(
-                        view,
-                        held.as_deref(),
-                        input.local.head_oid.as_deref(),
-                        |pin, oid| crate::git::contains_commit(&repo, pin, oid),
+                    pr.active_fetch = None;
+                    let config_gate = reconcile_plugin_config(
+                        app,
+                        cfg,
+                        area,
+                        &mut config_epoch,
+                        &recovery_tx,
+                        &mut recovery_inflight,
+                        &mut pr,
                     );
-                    let _ = tx.send(TaggedPr { generation, config_epoch: epoch, input, view });
-                });
+                    if config_gate.pr_unchanged() {
+                        pr.refresh.completed(
+                            completion,
+                            config_epoch,
+                            app.tab == crate::app::Tab::Pr,
+                        );
+                        pr.probe_pending = true;
+                    }
+                    if config_gate != ConfigGate::Unchanged {
+                        continue;
+                    }
+                }
+
+                // The probe is the authority on the current input.
+                if !app.gates_pr_drain()
+                    && let Ok((epoch, result)) = probe_rx.try_recv()
+                {
+                    if pr.active_probe_epoch != Some(epoch) {
+                        continue;
+                    }
+                    pr.active_probe_epoch = None;
+                    let config_gate = reconcile_plugin_config(
+                        app,
+                        cfg,
+                        area,
+                        &mut config_epoch,
+                        &recovery_tx,
+                        &mut recovery_inflight,
+                        &mut pr,
+                    );
+                    let mut repaint = false;
+                    if !config_gate.pr_unchanged() || epoch != config_epoch {
+                        if config_gate == ConfigGate::Unchanged && epoch != config_epoch {
+                            pr.config_changed(app.tab == crate::app::Tab::Pr);
+                        }
+                    } else {
+                        repaint = apply_pr_probe_result(app, &mut pr, result, config_epoch);
+                    }
+                    if config_gate != ConfigGate::Unchanged || repaint {
+                        continue;
+                    }
+                }
+
+                if app.pane_visible() && pr.can_start_probe(app.plugin_config().is_some()) {
+                    pr.probe_pending = false;
+                    let (tx, repo, base, plugin_config, epoch) = (
+                        probe_tx.clone(),
+                        app.repo.clone(),
+                        app.base.clone(),
+                        app.plugin_config().expect("config checked above").clone(),
+                        config_epoch,
+                    );
+                    let verifies_completion = pr.refresh.pending.is_some();
+                    pr.active_probe_epoch = Some(epoch);
+                    thread::spawn(move || {
+                        let input = if verifies_completion {
+                            crate::forge::verify_input(&repo, base.as_deref(), &plugin_config)
+                        } else {
+                            crate::forge::fetch_input(&repo, base.as_deref(), &plugin_config)
+                        };
+                        let _ = tx.send((epoch, input));
+                    });
+                }
+
+                if app.pane_visible()
+                    && pr.active_fetch.is_none()
+                    && pr.active_probe_epoch.is_none()
+                    && !pr.probe_pending
+                    && let Some((generation, input)) = pr.refresh.take_fetch()
+                {
+                    let (tx, repo, epoch) = (pr_tx.clone(), app.repo.clone(), config_epoch);
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    pr.active_fetch = Some(ActiveFetch {
+                        tag: (generation, epoch),
+                        cancelled: cancelled.clone(),
+                        started: Instant::now(),
+                    });
+                    let held = match &app.pr {
+                        crate::forge::PrView::Pr(snapshot) => Some(snapshot.head_oid.clone()),
+                        _ => None,
+                    };
+                    thread::spawn(move || {
+                        let view = crate::forge::fetch_cancellable(&repo, &input, &cancelled);
+                        // On the worker, so the event loop never runs git.
+                        let view = hold_gate(
+                            view,
+                            held.as_deref(),
+                            input.local.head_oid.as_deref(),
+                            |pin, oid| crate::git::contains_commit(&repo, pin, oid),
+                        );
+                        let _ = tx.send(TaggedPr { generation, config_epoch: epoch, input, view });
+                    });
+                }
+                // Only armed one-shot deadlines wake an idle loop; with none, it sleeps until something
+                // happens. A status line fades on time.
             }
-            // Only armed one-shot deadlines wake an idle loop; with none, it sleeps until something
-            // happens. A status line fades on time.
+
             let mut timeout = Duration::MAX;
+            if app.pane_visible() && app.config_error().is_none() && app.pr_target_request.is_some()
+            {
+                timeout = Duration::ZERO;
+            }
+            if let Some((_, _, _, started)) = &target_active {
+                let left = INDICATOR_DELAY.saturating_sub(started.elapsed());
+                if !left.is_zero() {
+                    timeout = timeout.min(left);
+                }
+            }
+
             if !app.status.is_empty() {
                 timeout = timeout.min(STATUS_TTL.saturating_sub(status_at.elapsed()));
             }
@@ -1472,6 +1625,9 @@ fn event_loop(
         }
         Ok(())
     })();
+    if let Some((_, _, cancelled, _)) = target_active.take() {
+        cancelled.store(true, Ordering::Release);
+    }
     // Leaving hands the shell back before the bounded drain; a switch keeps the screen to paint over.
     if result.is_err() || app.switch_to.is_none() {
         screen.release();
@@ -1893,6 +2049,20 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
+    if app.mode == Mode::PrPick {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            Esc => app.close_pr_picker(),
+            Enter => app.submit_pr_picker(),
+            Down => app.pr_picker_move(1),
+            Up => app.pr_picker_move(-1),
+            PageDown => app.pr_picker_move(PAGE),
+            PageUp => app.pr_picker_move(-PAGE),
+            code => apply_text_edit(app, code, ctrl, alt, alt || ctrl),
+        }
+        return Ok(());
+    }
+
     // Base and worktree pickers: every printable filters, so `qa` is typable; vertical keys move.
     if matches!(app.mode, Mode::BasePick | Mode::WorktreePick) {
         let base = app.mode == Mode::BasePick;
@@ -1942,6 +2112,12 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             (Some(K::TabChanges), _) => app.set_tab(crate::app::Tab::Changes)?,
             (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
             (Some(K::OpenPr), _) => app.pr_open(),
+            (Some(K::SelectPr), _) => app.open_pr_picker(),
+            (Some(K::UpdatePr), _) => app.update_pr_revision(),
+            (Some(K::ScopeUncommitted), _) => app.set_scope(Scope::Uncommitted)?,
+            (Some(K::ScopeBranch), _) => app.set_scope(Scope::Branch)?,
+            (Some(K::ScopeLastTurn), _) => app.set_scope(Scope::LastTurn)?,
+            (Some(K::ScopeCommits), _) => app.set_scope(Scope::Commits)?,
             (Some(K::WorktreePick), _) => app.open_worktree_picker(),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
@@ -1985,7 +2161,11 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         match action {
             K::Quit => app.request_quit(),
             K::Refresh => {
-                app.request_world_refresh(false);
+                if app.pr_target.is_some() {
+                    app.request_pr_refresh(crate::app::RefreshKind::Forced);
+                } else {
+                    app.request_world_refresh(false);
+                }
                 app.refresh_commanded = true;
             }
             K::TabChanges => app.set_tab(crate::app::Tab::Changes)?,
@@ -2039,6 +2219,8 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::PrevComment => app.jump_comment(-1),
             K::Comments => app.open_list(),
             K::Search => app.open_search(),
+            K::SelectPr => app.open_pr_picker(),
+            K::UpdatePr => app.update_pr_revision(),
             K::Find => app.open_find(),
             K::GotoLine => app.open_line(),
             K::Keys => app.toggle_keys(),
@@ -2559,6 +2741,15 @@ fn dispatch_mouse(
                     None => {}
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::PrPick => {
+                if let Some(i) = ui::hit_pr_picker_row(area, app, m.column, m.row) {
+                    if app.pr_picker.as_ref().is_some_and(|picker| picker.cursor == i) {
+                        app.submit_pr_picker();
+                    } else if let Some(picker) = &mut app.pr_picker {
+                        picker.cursor = i;
+                    }
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::WorktreePick => {
                 match ui::hit_worktree_picker_row(area, app, m.column, m.row) {
                     Some(i) if app.worktree_picker.as_ref().is_some_and(|wp| wp.cursor == i) => {
@@ -2621,10 +2812,15 @@ fn dispatch_mouse(
     if app.tab == crate::app::Tab::Pr {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(ui::HeaderHit::Tab(tab)) =
-                    ui::hit_header(area, app, keymap, m.column, m.row)
-                {
-                    app.set_tab(tab)?;
+                if let Some(hit) = ui::hit_header(area, app, keymap, m.column, m.row) {
+                    match hit {
+                        ui::HeaderHit::Tab(tab) => app.set_tab(tab)?,
+                        ui::HeaderHit::SelectPr => app.open_pr_picker(),
+                        ui::HeaderHit::UpdatePr => app.update_pr_revision(),
+                        ui::HeaderHit::Local => app.set_scope(app.scope)?,
+                        ui::HeaderHit::Browser => app.pr_open(),
+                        _ => {}
+                    }
                 } else if ui::hit_pr_open(area, app, m.column, m.row) {
                     app.pr_open();
                 } else if handle_text_down(app, m, area) {
@@ -2669,6 +2865,10 @@ fn dispatch_mouse(
             if let Some(hit) = ui::hit_header(area, app, keymap, m.column, m.row) {
                 match hit {
                     ui::HeaderHit::Tab(tab) => app.set_tab(tab)?,
+                    ui::HeaderHit::SelectPr => app.open_pr_picker(),
+                    ui::HeaderHit::UpdatePr => app.update_pr_revision(),
+                    ui::HeaderHit::Local => app.set_scope(app.scope)?,
+                    ui::HeaderHit::Browser => app.pr_open(),
                     ui::HeaderHit::Scope => app.set_scope(app.next_chip_scope())?,
                     // Inert under a `--base` flag.
                     ui::HeaderHit::Base => app.open_base_picker(),
@@ -3852,5 +4052,166 @@ mod startup_tests {
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
         let loaded = screen(&terminal);
         assert!(loaded.contains("a.txt") && !loaded.contains("load failed"), "{loaded}");
+    }
+}
+
+#[cfg(test)]
+mod pr_target_tests {
+    use crate::app::{App, Mode, PrTarget, PrTargetAction, PrTargetResult, Tab};
+    use crate::forge::{Merge, PrDetails, PrSnapshot, PrState, PrSummary, PrView, Sync};
+    use crate::git::{PrRevision, RepoTarget};
+    use crate::model::Scope;
+
+    fn repository() -> RepoTarget {
+        RepoTarget::new("github.com", "example", "project").unwrap()
+    }
+
+    fn snapshot(head: &str, base: &str) -> PrSnapshot {
+        PrSnapshot {
+            number: 42,
+            title: "Sample PR".into(),
+            url: "https://github.com/example/project/pull/42".into(),
+            body: String::new(),
+            state: PrState::Open,
+            is_draft: false,
+            head_ref: "feature".into(),
+            head_is_fork: false,
+            head_oid: head.into(),
+            base_ref: base.into(),
+            merge: Merge::Clean,
+            sync: Sync::InSync,
+            checks: Vec::new(),
+            comments: Vec::new(),
+            comments_truncated: false,
+            checks_truncated: false,
+        }
+    }
+
+    fn selected_app() -> App {
+        let mut app = App::new(".".into(), Scope::Uncommitted, None);
+        app.tab = Tab::Pr;
+        app.pr_target = Some(PrTarget {
+            repository: repository(),
+            number: 42,
+            url: snapshot("head", "main").url,
+            revision: PrRevision {
+                base_oid: "base".into(),
+                head_oid: "head".into(),
+                merge_base_oid: "merge".into(),
+            },
+        });
+        app.apply_pr(PrView::Pr(Box::new(snapshot("head", "main"))));
+        app
+    }
+
+    #[test]
+    fn a_typed_pr_number_wins_over_a_partial_list_match_and_errors_keep_the_query() {
+        let mut app = selected_app();
+        app.open_pr_picker();
+        let listing_generation = app.pr_target_generation;
+        app.apply_pr_list(
+            repository(),
+            vec![PrSummary {
+                number: 142,
+                title: "Other PR".into(),
+                url: "https://github.com/example/project/pull/142".into(),
+                head_ref: "other".into(),
+                base_ref: "main".into(),
+                is_draft: true,
+            }],
+        );
+        app.input_paste("42");
+        assert!(
+            app.pr_picker.as_ref().unwrap().visible().is_empty(),
+            "#142 is not a selectable match for #42"
+        );
+        app.submit_pr_picker();
+        assert!(matches!(app.pr_target_request.as_ref().map(|request| &request.action),
+            Some(PrTargetAction::Open(input)) if input == "42"));
+        let opening_generation = app.pr_target_generation;
+        app.apply_pr_target_result(listing_generation, Err("old list failed".into()));
+        assert!(app.pr_picker.as_ref().unwrap().error.is_none());
+        app.apply_pr_target_result(opening_generation, Err("PR #42 not found".into()));
+        assert_eq!(app.pr_picker.as_ref().unwrap().query, "42");
+        assert_eq!(app.pr_picker.as_ref().unwrap().error.as_deref(), Some("PR #42 not found"));
+        assert_eq!(app.pr_target.as_ref().unwrap().number, 42);
+        app.close_pr_picker();
+        app.apply_pr_target_result(opening_generation, Err("late open failure".into()));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pr_picker.is_none());
+        assert_ne!(app.pr_notice(), Some("late open failure"));
+    }
+
+    #[test]
+    fn enter_retries_a_failed_initial_pr_list_without_requiring_a_query() {
+        let mut app = selected_app();
+        app.open_pr_picker();
+        app.apply_pr_target_result(
+            app.pr_target_generation,
+            Err("Offline. Press Enter to retry.".into()),
+        );
+        app.submit_pr_picker();
+        assert!(matches!(
+            app.pr_target_request.as_ref().map(|request| &request.action),
+            Some(PrTargetAction::List)
+        ));
+        assert!(app.pr_picker.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn editing_an_open_request_cancels_it_without_cancelling_an_initial_listing() {
+        let mut app = selected_app();
+        app.open_pr_picker();
+        let listing_generation = app.pr_target_generation;
+        app.input_paste("42");
+        assert_eq!(app.pr_target_generation, listing_generation);
+        app.submit_pr_picker();
+        let opening_generation = app.pr_target_generation;
+        app.input_push('3');
+        assert_ne!(app.pr_target_generation, opening_generation);
+        assert_eq!(app.pr_picker.as_ref().unwrap().query, "423");
+        app.apply_pr_target_result(opening_generation, Err("cancelled open".into()));
+        assert!(app.pr_picker.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn metadata_refresh_keeps_the_reviewed_revision_until_an_explicit_update() {
+        for (base_oid, head_oid, base_ref) in [
+            ("base", "new-head", "main"),
+            ("new-base", "head", "main"),
+            ("base", "head", "release"),
+        ] {
+            let mut app = selected_app();
+            app.apply_pr_target_result(
+                app.pr_target_generation,
+                Ok(PrTargetResult::Refresh(PrDetails {
+                    snapshot: snapshot(head_oid, base_ref),
+                    base_oid: base_oid.into(),
+                })),
+            );
+            assert_eq!(app.pr_snapshot().unwrap().head_oid, "head");
+            assert_eq!(app.pr_snapshot().unwrap().base_ref, "main");
+            assert_eq!(app.pr_target.as_ref().unwrap().revision.head_oid, "head");
+            assert!(app.pr_newer.is_some());
+            assert!(app.pr_notice().unwrap().contains("reviewed revision"));
+            app.update_pr_revision();
+            assert!(matches!(
+                app.pr_target_request.as_ref().map(|r| &r.action),
+                Some(PrTargetAction::Update)
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_for_the_reviewed_revision_can_refresh_without_changing_the_code() {
+        let mut app = selected_app();
+        let mut fresh = snapshot("head", "main");
+        fresh.body = "Updated description".into();
+        app.apply_pr_target_result(
+            app.pr_target_generation,
+            Ok(PrTargetResult::Refresh(PrDetails { snapshot: fresh, base_oid: "base".into() })),
+        );
+        assert_eq!(app.pr_snapshot().unwrap().body, "Updated description");
+        assert!(app.pr_newer.is_none());
     }
 }

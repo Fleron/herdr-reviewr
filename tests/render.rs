@@ -52,6 +52,126 @@ fn render_size(app: &App, width: u16, height: u16) -> Buffer {
     terminal.backend().buffer().clone()
 }
 
+#[test]
+fn pr_picker_shows_repository_drafts_and_actionable_errors() {
+    use herdr_reviewr::{forge, git};
+    let repo = Repo::init();
+    repo.write("file.rs", "local\n");
+    repo.commit_all("base");
+    repo.git(&["remote", "add", "origin", "https://github.com/example/sample-review"]);
+    let mut app = app_on(&repo);
+    app.set_tab(Tab::Pr).unwrap();
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+        Rect::new(0, 0, 64, 24),
+        &Keymap::default(),
+    )
+    .unwrap();
+    let input =
+        forge::fetch_input(repo.path(), None, &herdr_reviewr::config::PluginConfig::default())
+            .unwrap();
+    let git::RepositoryIdentity::Repository(repository) = input.repository else {
+        panic!("sample repository");
+    };
+    app.apply_pr_list(
+        repository,
+        vec![
+            forge::PrSummary {
+                number: 42,
+                title: "Sample change".into(),
+                url: "https://github.com/example/sample-review/pull/42".into(),
+                head_ref: "feature".into(),
+                base_ref: "main".into(),
+                is_draft: true,
+            },
+            forge::PrSummary {
+                number: 43,
+                title: "Another sample change".into(),
+                url: "https://github.com/example/sample-review/pull/43".into(),
+                head_ref: "another-feature".into(),
+                base_ref: "main".into(),
+                is_draft: false,
+            },
+        ],
+    );
+    let out = dump(&render_size(&app, 64, 24));
+    for expected in ["Open PR", "sample-review", "#42", "draft"] {
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+    let row_background = |frame: &Buffer, label: &str| {
+        let out = dump(frame);
+        let (row, text) = out.lines().enumerate().find(|(_, text)| text.contains(label)).unwrap();
+        let col = text.chars().position(|ch| ch == '#').unwrap();
+        frame[(col as u16, row as u16)].bg
+    };
+    let before = render_size(&app, 64, 24);
+    assert_eq!(row_background(&before, "#42"), CURSOR_BG);
+    assert_ne!(row_background(&before, "#43"), CURSOR_BG);
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        Rect::new(0, 0, 64, 24),
+        &Keymap::default(),
+    )
+    .unwrap();
+    let after = render_size(&app, 64, 24);
+    assert_ne!(row_background(&after, "#42"), CURSOR_BG);
+    assert_eq!(row_background(&after, "#43"), CURSOR_BG);
+    app.pr_picker.as_mut().unwrap().error = Some("That PR belongs to another repository.".into());
+    let out = dump(&render_size(&app, 64, 24));
+    assert!(out.contains("another repository"), "{out}");
+}
+
+#[test]
+fn selected_pr_identity_and_reviewed_commit_remain_visible_in_every_tab() {
+    use herdr_reviewr::{forge, git, world};
+    let repo = Repo::init();
+    repo.write("file.rs", "committed\n");
+    repo.commit_all("base");
+    repo.git(&["remote", "add", "origin", "https://github.com/example/sample-review"]);
+    let mut app = app_on(&repo);
+    let input =
+        forge::fetch_input(repo.path(), None, &herdr_reviewr::config::PluginConfig::default())
+            .unwrap();
+    let git::RepositoryIdentity::Repository(repository) = input.repository else {
+        panic!("sample repository");
+    };
+    let head = git::head_oid(repo.path()).unwrap();
+    let revision = git::PrRevision {
+        base_oid: head.clone(),
+        head_oid: head.clone(),
+        merge_base_oid: head.clone(),
+    };
+    let mut input = app.world_input();
+    input.pr_revision = Some(revision.clone());
+    input.tab = Tab::Changes;
+    let changes = world::build(&input).unwrap();
+    input.tab = Tab::AllFiles;
+    let files = world::build(&input).unwrap();
+    app.install_pr_target(
+        forge::PreparedPr {
+            repository,
+            snapshot: forge::PrSnapshot {
+                number: 42,
+                head_oid: head.clone(),
+                ..common::pr_snapshot()
+            },
+            revision,
+        },
+        changes,
+        files,
+    );
+    for tab in [Tab::Changes, Tab::AllFiles, Tab::Pr] {
+        app.set_tab(tab).unwrap();
+        for width in [64, 90] {
+            let out = dump(&render_size(&app, width, 24));
+            assert!(out.contains("#42"), "{tab:?}, {width}: {out}");
+            assert!(out.contains(&head[..7]), "{tab:?}, {width}: {out}");
+        }
+    }
+}
+
 /// Catppuccin surface2 — the focused cursor row's fill, in the diff and in every list.
 const CURSOR_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x58, 0x5b, 0x70);
 /// Catppuccin's accent (herdr's blue): the caret block and the footer's keys.
@@ -1023,8 +1143,10 @@ fn pr_header_names_the_resolved_branch_and_marks_a_fork() {
     let width = 80;
     let area = Rect::new(0, 0, width, 12);
     let header = render_at(&app, width).lines().next().unwrap().to_string();
-    let chip_start = header.find("open #226").unwrap() as u16;
-    let number = header.find("#226").unwrap() as u16;
+    let chip_start =
+        unicode_width::UnicodeWidthStr::width(&header[..header.find("open #226").unwrap()]) as u16;
+    let number =
+        unicode_width::UnicodeWidthStr::width(&header[..header.find("#226").unwrap()]) as u16;
     assert!(ui::hit_pr_open(area, &app, chip_start, 0));
     assert!(ui::hit_pr_open(area, &app, number, 0));
     assert!(!ui::hit_pr_open(area, &app, chip_start - 1, 0));

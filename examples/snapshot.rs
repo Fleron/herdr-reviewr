@@ -42,6 +42,12 @@ const SCENES: &[Scene] = &[
     ("markdown-all", scene_markdown_all),
     ("selection", scene_selection),
     ("pr", scene_pr),
+    ("pr-picker", scene_pr_picker),
+    ("pr-picker-narrow", scene_pr_picker),
+    ("pr-picker-error", scene_pr_picker_error),
+    ("pr-target", scene_pr_target),
+    ("pr-target-narrow", scene_pr_target),
+    ("pr-update", scene_pr_update),
     ("quit", scene_quit),
 ];
 
@@ -56,6 +62,7 @@ fn main() {
             let (w, h) = match *name {
                 "markdown-all" => (W, TALL),
                 "split" => (WIDE, H),
+                "pr-picker-narrow" | "pr-target-narrow" => (64, H),
                 _ => (W, H),
             };
             let html = frame_html(&app, w, h);
@@ -76,6 +83,7 @@ fn fixture_repo() -> tempfile::TempDir {
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "s@example.com"]);
     git(&["config", "user.name", "snapshot"]);
+    git(&["remote", "add", "origin", "https://github.com/example/sample-review"]);
     std::fs::write(dir.path().join("src.rs"), RUST_BEFORE).unwrap();
     std::fs::write(dir.path().join("README.md"), MD_BEFORE).unwrap();
     std::fs::write(dir.path().join("GUIDE.md"), GUIDE_BEFORE).unwrap();
@@ -84,6 +92,16 @@ fn fixture_repo() -> tempfile::TempDir {
     std::fs::write(dir.path().join("src.rs"), RUST_AFTER).unwrap();
     std::fs::write(dir.path().join("README.md"), MD_AFTER).unwrap();
     std::fs::write(dir.path().join("GUIDE.md"), GUIDE_AFTER).unwrap();
+    let tree = herdr_reviewr::git::snapshot_worktree(dir.path()).unwrap();
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["commit-tree", &tree, "-p", "HEAD", "-m", "Sample PR revision"])
+        .output()
+        .unwrap();
+    assert!(commit.status.success());
+    let head = String::from_utf8(commit.stdout).unwrap();
+    git(&["update-ref", "refs/heads/sample-pr", head.trim()]);
     dir
 }
 
@@ -415,6 +433,100 @@ fn scene_pr(repo: &Path, theme: &str) -> App {
         comments_truncated: false,
         checks_truncated: false,
     }));
+    app
+}
+
+fn scene_pr_picker(repo: &Path, theme: &str) -> App {
+    let mut app = scene_pr(repo, theme);
+    app.open_pr_picker();
+    let input = herdr_reviewr::forge::fetch_input(
+        repo,
+        None,
+        &herdr_reviewr::config::PluginConfig::default(),
+    )
+    .unwrap();
+    let herdr_reviewr::git::RepositoryIdentity::Repository(repository) = input.repository else {
+        panic!("sample repository");
+    };
+    app.apply_pr_list(
+        repository,
+        vec![
+            herdr_reviewr::forge::PrSummary {
+                number: 42,
+                title: "Sample: apply discounts to order totals".into(),
+                url: "https://github.com/example/sample-review/pull/42".into(),
+                head_ref: "discounts".into(),
+                base_ref: "main".into(),
+                is_draft: false,
+            },
+            herdr_reviewr::forge::PrSummary {
+                number: 39,
+                title: "Sample: keep comment anchors across revisions".into(),
+                url: "https://github.com/example/sample-review/pull/39".into(),
+                head_ref: "comment-anchors".into(),
+                base_ref: "main".into(),
+                is_draft: true,
+            },
+        ],
+    );
+    app
+}
+
+fn scene_pr_picker_error(repo: &Path, theme: &str) -> App {
+    let mut app = scene_pr_picker(repo, theme);
+    let picker = app.pr_picker.as_mut().unwrap();
+    picker.query = "https://github.com/other/repository/pull/42".into();
+    picker.caret = picker.query.len();
+    picker.error = Some("That PR belongs to another repository.".into());
+    app
+}
+
+fn scene_pr_target(repo: &Path, theme: &str) -> App {
+    let mut app = scene_pr(repo, theme);
+    let input = herdr_reviewr::forge::fetch_input(
+        repo,
+        None,
+        &herdr_reviewr::config::PluginConfig::default(),
+    )
+    .unwrap();
+    let herdr_reviewr::git::RepositoryIdentity::Repository(repository) = input.repository else {
+        panic!("sample repository");
+    };
+    let base = herdr_reviewr::git::head_oid(repo).unwrap();
+    let head = herdr_reviewr::git::resolve_commit(repo, "sample-pr").unwrap().unwrap();
+    let revision = herdr_reviewr::git::PrRevision {
+        base_oid: base.clone(),
+        head_oid: head.clone(),
+        merge_base_oid: base,
+    };
+    let mut snapshot = app.pr_snapshot().unwrap().clone();
+    snapshot.head_oid = head;
+    snapshot.title = "Sample: apply discounts to order totals".into();
+    snapshot.url = "https://github.com/example/sample-review/pull/42".into();
+    let mut world = app.world_input();
+    world.pr_revision = Some(revision.clone());
+    world.tab = Tab::Changes;
+    let changes = herdr_reviewr::world::build(&world).unwrap();
+    world.tab = Tab::AllFiles;
+    let files = herdr_reviewr::world::build(&world).unwrap();
+    app.install_pr_target(
+        herdr_reviewr::forge::PreparedPr { repository, snapshot, revision },
+        changes,
+        files,
+    );
+    app.set_tab(Tab::Changes).unwrap();
+    app
+}
+
+fn scene_pr_update(repo: &Path, theme: &str) -> App {
+    let mut app = scene_pr_target(repo, theme);
+    app.set_tab(Tab::Pr).unwrap();
+    let mut snapshot = app.pr_snapshot().unwrap().clone();
+    snapshot.head_oid = "cccccccccccccccccccccccccccccccccccccccc".into();
+    app.apply_pr_details(herdr_reviewr::forge::PrDetails {
+        snapshot,
+        base_oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+    });
     app
 }
 

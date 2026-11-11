@@ -6,6 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Open a repository PR** from the PR tab with `P`. Review its pinned diff, head-commit files and PR information across all tabs, and explicitly update its revision with `Ctrl+R`.
+
 ### Changed
 - **Fork plugin installs build the checked-out source** with the lockfile, preserving the existing plugin ID and keybindings. Installation requires Rust.
 

@@ -50,6 +50,8 @@ pub enum Action {
     SendTo,
     Copy,
     OpenPr,
+    SelectPr,
+    UpdatePr,
     Refresh,
     Quit,
     /// Quit and drop unsent comments; its own key, so a held `q` can't answer its own question.
@@ -158,7 +160,7 @@ impl Key {
 }
 
 /// Every action with its config name and default keys, the one table the keymap derives from.
-const ACTIONS: [(Action, &str, &[Key]); 48] = [
+const ACTIONS: [(Action, &str, &[Key]); 50] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -204,6 +206,8 @@ const ACTIONS: [(Action, &str, &[Key]); 48] = [
     (Action::SendTo, "send-to", &[Key::plain('S')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
+    (Action::SelectPr, "select-pr", &[Key::plain('P')]),
+    (Action::UpdatePr, "update-pr", &[Key::ctrl('r')]),
     (Action::Refresh, "refresh", &[Key::plain('r')]),
     (Action::Quit, "quit", &[Key::plain('q')]),
     (Action::QuitDiscard, "quit-discard", &[Key::plain('Q')]),

@@ -64,6 +64,7 @@ impl CommitPick {
 pub enum Rev {
     Worktree,
     Commit(CommitPick),
+    Pr { url: String, base: String, head: String },
 }
 
 /// How a file changed within a scope.

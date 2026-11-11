@@ -33,7 +33,7 @@ comment on lines, and send the comments back.
 - **Worktree switch** — follow your agent into another worktree with `W`.
 - **Search** — files by name and code by content, powered by [fff](https://github.com/dmtrKovalenko/fff).
 - **Find in file** — step through every match.
-- **PR view** — the branch's pull request, read-only.
+- **PR review** — open a repository pull request and review its pinned diff, files and status.
 - **Markdown review** — `m` renders a `.md` file.
 - **Themes** — 20, dark and light.
 
@@ -46,6 +46,7 @@ reviewr never edits your files, never sends on its own, and never posts to your 
 - **macOS, Linux, or Windows.**
 - **Rust**, using the toolchain in `rust-toolchain.toml`, to build this fork during installation.
 - For the PR tab only: **`gh`**, **`glab`**, or **`az`** (with the `azure-devops` extension), logged in.
+- Opening a PR as the review target requires **Git 2.41 or newer**.
 
 ## Install
 
@@ -166,7 +167,9 @@ The usual editing keys work: arrows, `Home` / `End`, `Ctrl+A` / `Ctrl+E`, `Alt+b
 | `j` `k` | Move through description and comments |
 | `PageUp` `PageDown` | Scroll |
 | `o` | Open in browser |
-| `r` | Refresh |
+| `P` | Open a repository PR |
+| `r` | Refresh status; keep the selected review revision |
+| `Ctrl+R` | Update the selected PR to its latest revision |
 
 **Mouse:** drag to copy, double-click a word, triple-click a line. Click or drag line numbers to
 comment. Click files, tabs, and links. Scroll with the wheel.
@@ -174,8 +177,8 @@ comment. Click files, tabs, and links. Scroll with the wheel.
 ## The three tabs
 
 - **Changes** — files the current scope changed.
-- **All files** — every file in the worktree. You can comment here too. Git-ignored files are dimmed.
-- **PR** — the branch's pull request (merge request on GitLab): state, checks, description, comments.
+- **All files** — every file in the worktree, or in the selected PR's head commit. You can comment here too. Git-ignored worktree files are dimmed.
+- **PR** — the branch's pull request (merge request on GitLab), or a PR you select: state, checks, description, comments.
 
 Switching between **Changes** and **All files** keeps your file and line when the other tab lists
 the file. `follow_file_across_tabs = false` gives each tab its own place instead.
@@ -190,6 +193,27 @@ the file. `follow_file_across_tabs = false` gives each tab its own place instead
 
 reviewr starts in **uncommitted** (`default_scope` changes that). Git-ignored files never show
 in **Changes**.
+
+## Review a pull request
+
+In the **PR** tab, choose **Open PR…** (`P`). The picker lists this repository's open PRs,
+including drafts. Filter by title or branch, or enter a PR number or URL. URLs for other
+repositories are rejected.
+
+Selecting a PR makes it the target across all three tabs: **Changes** compares its head against
+its base, **Files** reads its head commit, and **PR** shows its description, checks and comments.
+Reviewr fetches Git objects without checking out a branch or changing working files, the index,
+or ordinary remote-tracking refs. The header identifies the PR and reviewed commit.
+
+The comparison stays fixed while you review. `r` refreshes status; when the PR's head or base
+changes, **Update revision** (`Ctrl+R`) loads the new comparison across all tabs. A failed update
+keeps the last loaded revision and shows the error. Local scope keys (`u`, `b`, `t`, `g`) return
+to local review. Comments retain their original target and revision when you switch.
+
+The selected PR lasts for this running pane. Filesystem search (`/`) and opening a file in an
+editor are local-review actions; file filtering, in-file find and comment editing remain available
+when reviewing a PR. Desktop-launched reviews use this picker too; automatic Desktop selection
+is not included.
 
 ## Configuration
 
@@ -306,6 +330,8 @@ keys help non-Latin layouts: bind the character your layout types on the same ke
 | `send-to` | `S` |
 | `copy` | `y`, `Y` |
 | `open-pr` | `o` |
+| `select-pr` | `P` |
+| `update-pr` | `ctrl+r` |
 | `refresh` | `r` |
 | `quit` | `q` |
 | `quit-discard` | `Q` |

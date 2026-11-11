@@ -114,6 +114,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
         Mode::WorktreePick => Some(render_worktree_picker),
+        Mode::PrPick => Some(render_pr_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -1242,6 +1243,10 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HeaderHit {
     Tab(Tab),
+    SelectPr,
+    UpdatePr,
+    Local,
+    Browser,
     Scope,
     /// The `branch` scope's base label; the click opens the base picker.
     Base,
@@ -1262,15 +1267,36 @@ pub fn hit_header(area: Rect, app: &App, keymap: &Keymap, col: u16, row: u16) ->
         }
     }
     let prefix = header_prefix_len(&spans);
+    if app.tab == Tab::Pr {
+        let mut start = prefix;
+        if app.pr_target.is_some() {
+            let end = start + pr_target_label(app, area.width).width();
+            if (start..end).contains(&(col as usize)) {
+                return Some(HeaderHit::Local);
+            }
+            start = end + 1;
+        }
+        for (hit, label) in pr_header_actions(app) {
+            if start + label.width() + 1 > pr_actions_width(app, area.width) {
+                continue;
+            }
+            let end = start + label.width();
+            if (start..end).contains(&(col as usize)) {
+                return Some(hit);
+            }
+            start = end + 1;
+        }
+        return None;
+    }
     let scope_start = prefix as u16;
     let scope_end = scope_start + scope_chip(app).len() as u16;
     if (scope_start..scope_end).contains(&col) {
-        return Some(HeaderHit::Scope);
+        return Some(if app.pr_target.is_some() { HeaderHit::Local } else { HeaderHit::Scope });
     }
     if let Some((lead, name, tail)) = base_parts(app, keymap, area.width) {
         let base_start = scope_end + BASE_GAP.len() as u16;
         let base_end = base_start + (lead.width() + name.width() + tail.width()) as u16;
-        if (base_start..base_end).contains(&col) {
+        if (base_start..base_end).contains(&col) && app.pr_target.is_none() {
             return Some(if app.scope == crate::model::Scope::Commits {
                 HeaderHit::Pick
             } else {
@@ -1323,11 +1349,34 @@ fn header_prefix_len(spans: &[(Tab, usize, usize)]) -> usize {
 }
 
 fn scope_chip(app: &App) -> String {
+    if let Some(target) = &app.pr_target {
+        return format!(
+            "[PR {}{}] {}",
+            target.repository.forge().sigil(),
+            target.number,
+            &target.revision.head_oid[..target.revision.head_oid.len().min(7)]
+        );
+    }
     format!("[{}]", app.scope.label())
+}
+
+fn pr_target_label(app: &App, width: u16) -> String {
+    let chip = scope_chip(app);
+    let Some(snapshot) = app.pr_snapshot() else { return chip };
+    let available = (width as usize).saturating_sub(
+        header_prefix_len(&tab_spans(app.keymap(), app.pr_forge)) + chip.width() + 4,
+    );
+    let base = truncate_width(&snapshot.base_ref, available.min(24));
+    if base.is_empty() { chip } else { format!("{chip} vs {base}") }
 }
 
 /// The base label as `(lead, shown, marker, tail)`; `marker` is ` (sha)` for a named rev.
 fn base_label(app: &App) -> Option<(String, String, String, String)> {
+    if app.pr_target.is_some() {
+        return app.pr_snapshot().map(|snapshot| {
+            ("vs ".into(), snapshot.base_ref.clone(), String::new(), String::new())
+        });
+    }
     if app.scope == crate::model::Scope::Commits {
         return pick_label(app);
     }
@@ -1384,7 +1433,7 @@ fn base_parts(app: &App, keymap: &Keymap, width: u16) -> Option<(String, String,
         + scope_chip(app).len()
         + BASE_GAP.len()
         + lead.width()
-        + header_suffix(app).width()
+        + if app.pr_target.is_some() { 0 } else { header_suffix(app).width() }
         + HEADER_LEAD.len()
         + 1;
     let budget = (width as usize).saturating_sub(fixed);
@@ -2993,6 +3042,9 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // `enter` opens the highlight in every list: a search result, a base, a commit run.
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
+        A::SelectPr => (hint(K::SelectPr), "Open PR…"),
+        A::UpdatePr => (hint(K::UpdatePr), "Update revision"),
+        A::PickPrRow => ("enter".into(), "Open PR"),
         A::Refresh => (hint(K::Refresh), "refresh"),
         A::Tabs => {
             (format!("{}·{}·{}", hint(K::TabChanges), hint(K::TabAllFiles), hint(K::TabPr)), "tabs")
@@ -3634,6 +3686,83 @@ fn base_picker_title(bp: &crate::app::BasePicker) -> String {
 
 fn base_picker_scroll(bp: &crate::app::BasePicker, rows: usize) -> usize {
     menu_scroll(bp.cursor, bp.visible().len(), rows)
+}
+
+fn pr_picker_popup(area: Rect, app: &App) -> Rect {
+    menu_popup(area, app, 72, "Open PR", 16)
+}
+
+fn pr_picker_list(area: Rect, app: &App) -> (Rect, Vec<String>) {
+    let inner = picker_inner(pr_picker_popup(area, app));
+    let Some(picker) = &app.pr_picker else { return (inner, Vec::new()) };
+    let message = if let Some(error) = &picker.error {
+        error.as_str()
+    } else if picker.loading {
+        if picker.busy { "Opening PR…" } else { "Loading PRs…" }
+    } else if picker.repository.is_some() && picker.visible().is_empty() {
+        "No open PRs match. Enter a PR URL or number."
+    } else {
+        ""
+    };
+    let note = wrap_text(message, inner.width.max(1) as usize);
+    let top = (2 + note.len() as u16).min(inner.height);
+    (Rect { y: inner.y + top, height: inner.height.saturating_sub(top), ..inner }, note)
+}
+
+fn render_pr_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(picker) = &app.pr_picker else { return };
+    let p = app.palette();
+    let inner = menu_box(frame, p, pr_picker_popup(area, app), "Open PR");
+    if inner.height == 0 {
+        return;
+    }
+    menu_filter(frame, p, inner, (&picker.query, picker.caret), "PR URL, number, or search…");
+    let repository = picker.repository.as_ref().map_or_else(
+        || "Current repository".into(),
+        |target| format!("{}/{}", target.host(), target.full_path()),
+    );
+    if inner.height > 1 {
+        menu_note(frame, p, Rect { y: inner.y + 1, height: 1, ..inner }, &repository);
+    }
+    let (list, note) = pr_picker_list(area, app);
+    for (i, line) in note.into_iter().enumerate().take(inner.height.saturating_sub(2) as usize) {
+        let color = if picker.error.is_some() { Ink::Warning } else { Ink::TextMuted };
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().fg(p.ink(color, Fill::Base))),
+            Rect { y: inner.y + 2 + i as u16, height: 1, ..inner },
+        );
+    }
+    let visible = picker.visible();
+    let first = menu_scroll(picker.cursor, visible.len(), list.height as usize);
+    let rows: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(list.height as usize)
+        .map(|(cursor, &index)| {
+            let row = &picker.rows[index];
+            let draft = if row.is_draft { " · draft" } else { "" };
+            let text = truncate_width(
+                &format!("#{} {}{draft}", row.number, row.title),
+                list.width as usize,
+            );
+            selectable_row(
+                p,
+                vec![Span::raw(text)],
+                list.width as usize,
+                cursor_fill(cursor == picker.cursor),
+            )
+        })
+        .collect();
+    frame.render_widget(List::new(rows), list);
+}
+
+pub fn hit_pr_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
+    let picker = app.pr_picker.as_ref()?;
+    let (list, _) = pr_picker_list(area, app);
+    let visible = picker.visible();
+    let first = menu_scroll(picker.cursor, visible.len(), list.height as usize);
+    menu_hit(list, 0, first, visible.len(), col, row)
 }
 
 fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -4522,10 +4651,54 @@ fn selectable_row(
 // --- PR tab --------------------------------
 
 /// The `PR` tab's header: tabs, then the title and a clickable `status #number ↗` chip.
+fn pr_header_actions(app: &App) -> Vec<(HeaderHit, String)> {
+    use crate::keymap::Action as K;
+    let hint = |key| app.keymap().hint(key).label();
+    let mut actions = Vec::new();
+    if app.pr_newer.is_some() {
+        actions.push((HeaderHit::UpdatePr, format!("[{} Update revision]", hint(K::UpdatePr))));
+    }
+    actions.push((HeaderHit::SelectPr, format!("[{} Open PR…]", hint(K::SelectPr))));
+    if app.pr_target.is_some() {
+        actions.push((HeaderHit::Local, "[Local review]".into()));
+        actions.push((HeaderHit::Browser, format!("[{} ↗]", hint(K::OpenPr))));
+    }
+    actions
+}
+
+fn pr_actions_width(app: &App, width: u16) -> usize {
+    let reserved = if app.pr_target.is_none() {
+        app.pr_snapshot().map_or(0, |snapshot| pr_chip_width(app, snapshot) + 6)
+    } else {
+        0
+    };
+    (width as usize).saturating_sub(reserved)
+}
+
 fn render_pr_header(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let bar = Style::default().bg(p.fill(Fill::Bar));
     let mut spans = tab_bar_spans(app);
+    if app.pr_target.is_some() {
+        spans.push(Span::styled(
+            pr_target_label(app, area.width),
+            bar.fg(p.ink(Ink::Accent, Fill::Bar)),
+        ));
+        spans.push(Span::styled(" ", bar));
+    }
+    let mut used: usize = spans.iter().map(Span::width).sum();
+    for (_, label) in pr_header_actions(app) {
+        if used + label.width() + 1 > pr_actions_width(app, area.width) {
+            continue;
+        }
+        used += label.width() + 1;
+        spans.push(Span::styled(label, bar.fg(p.ink(Ink::Accent, Fill::Bar))));
+        spans.push(Span::styled(" ", bar));
+    }
+    if app.pr_target.is_some() {
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+        return;
+    }
     let lead_tabs: usize = spans.iter().map(Span::width).sum();
     let w = area.width as usize;
 
@@ -5076,7 +5249,7 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The message for a PR view with nothing to show, in the forge's noun.
-fn pr_empty_msg(
+pub(crate) fn pr_empty_msg(
     view: &forge::PrView,
     forge: crate::git::Forge,
     refresh: crate::keymap::Key,
@@ -5115,6 +5288,9 @@ fn pr_empty_msg(
 /// Whether a click lands on the header's PR chip.
 #[must_use]
 pub fn hit_pr_open(area: Rect, app: &App, col: u16, row: u16) -> bool {
+    if app.pr_target.is_some() {
+        return false;
+    }
     let Some(s) = app.pr_snapshot() else {
         return false;
     };

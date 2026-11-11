@@ -9,7 +9,18 @@ use crate::model::Comment;
 
 /// One comment as its export block: location, snippet, then text.
 pub fn format_comment(comment: &Comment) -> String {
-    format!("{}\n{}\n{}", comment.location(), comment.lines, normalize_text(&comment.text))
+    let revision = match &comment.rev {
+        crate::model::Rev::Pr { url, base, head } => {
+            format!("PR: {url}\nReviewed: {base}...{head}\n")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "{revision}{}\n{}\n{}",
+        comment.location(),
+        comment.lines,
+        normalize_text(&comment.text)
+    )
 }
 
 /// Comment text without blank lines, which would read as the separator between comments.

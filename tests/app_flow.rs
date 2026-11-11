@@ -12337,3 +12337,223 @@ fn a_split_text_drag_scrolls_sideways_at_its_own_halfs_edges() {
     assert_eq!(app.h_scroll, 2, "the new half's left edge scrolls left");
     split_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), divider);
 }
+
+fn pr_target_fixture() -> (Repo, App, String, String, String) {
+    let r = Repo::init();
+    r.write("shared.rs", "base\nsecond\nthird\n");
+    r.commit_all("base");
+    let base = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-qb", "pr-head"]);
+    r.write("shared.rs", "PR first\nsecond\nthird\n");
+    r.write("pr-only.txt", "Only in the PR\n");
+    r.commit_all("PR first");
+    let first = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("shared.rs", "PR second\nsecond\nthird\n");
+    r.commit_all("PR second");
+    let second = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-q", "main"]);
+    r.git(&["remote", "add", "origin", "https://github.com/example/project.git"]);
+    r.write("shared.rs", "LOCAL dirty\nsecond\nthird\n");
+    r.write("local-only.txt", "Only in the worktree\n");
+    let mut app = app_on(&r);
+    let row = file_row_of(&app, "shared.rs").unwrap();
+    app.select_file(row).unwrap();
+    (r, app, base, first, second)
+}
+
+fn select_pr_revision(r: &Repo, app: &mut App, base: &str, head: &str) {
+    use herdr_reviewr::{forge, git, world};
+    let input = forge::fetch_input(r.path(), None, &herdr_reviewr::config::PluginConfig::default())
+        .unwrap();
+    let git::RepositoryIdentity::Repository(repository) = input.repository else {
+        panic!("fixture remote")
+    };
+    let revision = git::PrRevision {
+        base_oid: base.into(),
+        head_oid: head.into(),
+        merge_base_oid: base.into(),
+    };
+    let snapshot = forge::PrSnapshot {
+        title: "Sample PR".into(),
+        url: "https://github.com/example/project/pull/42".into(),
+        number: 42,
+        head_oid: head.into(),
+        ..common::pr_snapshot()
+    };
+    let mut changes = app.world_input();
+    changes.pr_revision = Some(revision.clone());
+    changes.tab = Tab::Changes;
+    let mut files = changes.clone();
+    files.tab = Tab::AllFiles;
+    app.install_pr_target(
+        forge::PreparedPr { repository, snapshot, revision },
+        world::build(&changes).unwrap(),
+        world::build(&files).unwrap(),
+    );
+}
+
+#[test]
+fn pr_target_uses_the_same_pinned_git_revision_in_every_tab_without_changing_local_files() {
+    let (r, mut app, base, first, _) = pr_target_fixture();
+    let before_status = r.git(&["status", "--porcelain=v1"]);
+    let before_index = std::fs::read(r.path().join(".git/index")).unwrap();
+    let before_head = r.git(&["rev-parse", "HEAD"]);
+    select_pr_revision(&r, &mut app, &base, &first);
+    assert!(file_row_of(&app, "pr-only.txt").is_some());
+    assert!(file_row_of(&app, "local-only.txt").is_none());
+    let row = file_row_of(&app, "shared.rs").unwrap();
+    app.select_file(row).unwrap();
+    assert!(app.diff.rows.iter().any(|row| row.text().contains("PR first")));
+    assert!(!app.diff.rows.iter().any(|row| row.text().contains("LOCAL")));
+    enter_tab(&mut app, Tab::AllFiles);
+    assert!(file_row_of(&app, "pr-only.txt").is_some());
+    assert!(file_row_of(&app, "local-only.txt").is_none());
+    let row = file_row_of(&app, "shared.rs").unwrap();
+    app.select_file(row).unwrap();
+    assert!(app.diff.rows.iter().any(|row| row.text().contains("PR first")));
+    assert!(!app.diff.rows.iter().any(|row| row.text().contains("LOCAL")));
+    enter_tab(&mut app, Tab::Pr);
+    assert_eq!(app.pr_snapshot().unwrap().head_oid, first);
+    assert_eq!(app.pr_target.as_ref().unwrap().revision.base_oid, base);
+    assert_eq!(r.git(&["rev-parse", "HEAD"]), before_head);
+    assert_eq!(std::fs::read(r.path().join(".git/index")).unwrap(), before_index);
+    assert_eq!(r.git(&["status", "--porcelain=v1"]), before_status);
+    assert_eq!(
+        std::fs::read_to_string(r.path().join("shared.rs")).unwrap(),
+        "LOCAL dirty\nsecond\nthird\n"
+    );
+}
+
+#[test]
+fn pr_target_comments_keep_their_target_and_revision_and_local_review_keeps_its_place() {
+    let (r, mut app, base, first, second) = pr_target_fixture();
+    comment_on(&mut app, '+', "local comment");
+    let local_file = app.diff_path.clone();
+    let local_cursor = app.diff_cursor;
+    select_pr_revision(&r, &mut app, &base, &first);
+    assert!(app.is_stale(app.store.get(0).unwrap()));
+    let row = file_row_of(&app, "shared.rs").unwrap();
+    app.select_file(row).unwrap();
+    comment_on(&mut app, '+', "PR diff comment");
+    enter_tab(&mut app, Tab::AllFiles);
+    let row = file_row_of(&app, "shared.rs").unwrap();
+    app.select_file(row).unwrap();
+    app.focus = Focus::Diff;
+    app.diff_cursor = 1;
+    app.start_comment();
+    app.input_paste("PR file comment");
+    app.submit_comment();
+    assert_eq!(app.store.len(), 3);
+    for index in [1, 2] {
+        assert!(matches!(&app.store.get(index).unwrap().rev,
+            herdr_reviewr::model::Rev::Pr { head, .. } if head == &first));
+        assert!(!app.is_stale(app.store.get(index).unwrap()));
+    }
+    select_pr_revision(&r, &mut app, &base, &second);
+    assert_eq!(app.pr_snapshot().unwrap().head_oid, second);
+    assert!(app.diff.rows.iter().any(|row| row.text().contains("PR second")));
+    for index in [1, 2] {
+        assert!(app.is_stale(app.store.get(index).unwrap()));
+    }
+    let comments: Vec<_> = app.store.iter().collect();
+    let exported = herdr_reviewr::export::format_review(None, r.path(), &comments);
+    assert!(exported.contains("https://github.com/example/project/pull/42"));
+    assert!(exported.contains(&format!("{base}...{first}")));
+    assert!(exported.contains("local comment"));
+    app.set_scope(app.scope).unwrap();
+    assert!(app.pr_target.is_none(), "selecting the already-selected local scope returns local");
+    enter_tab(&mut app, Tab::Changes);
+    assert_eq!(app.diff_path, local_file);
+    assert_eq!(app.diff_cursor, local_cursor);
+    assert!(!app.is_stale(app.store.get(0).unwrap()));
+    assert_eq!(app.store.len(), 3);
+    assert!(app.diff.rows.iter().any(|row| row.text().contains("LOCAL dirty")));
+}
+
+#[test]
+fn pr_target_cannot_search_or_edit_unrelated_worktree_content() {
+    let (r, mut app, base, first, _) = pr_target_fixture();
+    select_pr_revision(&r, &mut app, &base, &first);
+    app.start_edit();
+    assert!(app.editor_request.is_none());
+    assert!(app.status.contains("local review"));
+    app.open_search();
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.status.contains("local review"));
+    app.focus = Focus::Diff;
+    app.open_find();
+    assert_eq!(app.mode, Mode::Find, "in-file find still searches the pinned content");
+}
+
+#[test]
+fn pr_target_picker_uses_keyboard_and_mouse_without_changing_the_browser_action() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    enter_tab(&mut app, Tab::Pr);
+    let keymap = Keymap::default();
+    assert_eq!(keymap.action_for(Key::plain('o')), Some(Action::OpenPr));
+    assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::NavigatorPosition));
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    assert_eq!(app.mode, Mode::PrPick);
+    app.close_pr_picker();
+    let area = Rect::new(0, 0, 100, 30);
+    let col = (0..area.width)
+        .find(|&col| {
+            herdr_reviewr::ui::hit_header(area, &app, &keymap, col, 0)
+                == Some(herdr_reviewr::ui::HeaderHit::SelectPr)
+        })
+        .expect("Open PR has a mouse target");
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &[],
+        &keymap,
+        &FakeTarget::ok(),
+    )
+    .unwrap();
+    assert_eq!(app.mode, Mode::PrPick);
+}
+
+#[test]
+fn pr_target_file_follow_uses_the_head_tree_and_preserves_its_line_and_folds() {
+    use std::fmt::Write as _;
+    let r = Repo::init();
+    let mut original = String::new();
+    for n in 1..=80 {
+        writeln!(original, "line {n}").unwrap();
+    }
+    r.write("local-name.rs", &original);
+    r.commit_all("base");
+    let base = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-qb", "pr-head"]);
+    r.git(&["mv", "local-name.rs", "pr-only.rs"]);
+    r.write("pr-only.rs", &original.replace("line 40\n", "PR line 40\n"));
+    r.commit_all("rename in PR");
+    let head = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-q", "main"]);
+    r.git(&["remote", "add", "origin", "https://github.com/example/project.git"]);
+    assert!(!r.path().join("pr-only.rs").exists());
+    let mut app = app_on(&r);
+    select_pr_revision(&r, &mut app, &base, &head);
+    let row = file_row_of(&app, "pr-only.rs").unwrap();
+    app.select_file(row).unwrap();
+    app.focus = Focus::Diff;
+    app.diff_cursor =
+        app.visible.iter().position(|row| row.fold_anchor().is_some()).expect("context is folded");
+    app.expand_fold(&vec![1; app.visible.len()], 30);
+    cursor_to(&mut app, (Some(20), Some(20)));
+    let expanded = app.visible.clone();
+    enter_tab(&mut app, Tab::AllFiles);
+    assert_eq!(app.diff_path.as_deref(), Some("pr-only.rs"));
+    assert_eq!(cursor_lines(&app).1, Some(20));
+    enter_tab(&mut app, Tab::Changes);
+    assert_eq!(app.diff_path.as_deref(), Some("pr-only.rs"));
+    assert_eq!(cursor_lines(&app), (Some(20), Some(20)));
+    assert_eq!(app.visible, expanded, "returning keeps the expanded context fold");
+}
