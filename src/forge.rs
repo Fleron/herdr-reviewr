@@ -44,7 +44,10 @@ pub enum PrView {
 impl PrView {
     /// The remedy for a retryable failure, which keeps the visible snapshot; `None` otherwise.
     pub fn retry_remedy(&self, refresh: crate::keymap::Key) -> Option<String> {
-        let refresh = refresh.label();
+        self.retry_remedy_label(&refresh.label())
+    }
+
+    pub(crate) fn retry_remedy_label(&self, refresh: &str) -> Option<String> {
         match self {
             Self::NoCli(forge) => Some(format!(
                 "{} CLI not found. Install `{}`, then press {refresh}.",
@@ -124,6 +127,143 @@ pub struct PrSnapshot {
     pub comments_truncated: bool,
     /// Checks had more rows than the 100-row fetch.
     pub checks_truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrSummary {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub is_draft: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrDetails {
+    pub snapshot: PrSnapshot,
+    pub base_oid: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPr {
+    pub repository: crate::git::RepoTarget,
+    pub snapshot: PrSnapshot,
+    pub revision: crate::git::PrRevision,
+}
+
+pub fn list_open_prs(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PrSummary>, PrView> {
+    let mut rows = match target.forge() {
+        crate::git::Forge::GitHub => github_open_prs(repo, target, cancelled).map_err(PrView::from),
+        crate::git::Forge::GitLab => crate::gitlab::list_open_prs(repo, target, cancelled),
+        crate::git::Forge::AzureDevOps => {
+            crate::azure_devops::list_open_prs(repo, target, cancelled)
+        }
+    }?;
+    rows.sort_by_key(|row| std::cmp::Reverse(row.number));
+    Ok(rows)
+}
+
+pub fn fetch_pr_details(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<PrDetails, PrView> {
+    let details = match target.forge() {
+        crate::git::Forge::GitHub => {
+            github_pr_details(repo, target, number, cancelled).map_err(PrView::from)
+        }
+        crate::git::Forge::GitLab => crate::gitlab::pr_details(repo, target, number, cancelled),
+        crate::git::Forge::AzureDevOps => {
+            crate::azure_devops::pr_details(repo, target, number, cancelled)
+        }
+    }?;
+    if details.snapshot.number != number
+        || details.base_oid.is_empty()
+        || details.snapshot.head_oid.is_empty()
+    {
+        return Err(PrView::Error(target.forge(), "PR comparison commits are unavailable; retry after the forge finishes preparing the PR".into()));
+    }
+    Ok(details)
+}
+
+pub fn prepare_pr(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<PreparedPr, PrView> {
+    let details = fetch_pr_details(repo, target, number, cancelled)?;
+    let revision = crate::git::fetch_pr_revision(
+        repo,
+        target,
+        number,
+        &details.base_oid,
+        &details.snapshot.head_oid,
+        cancelled,
+    )
+    .map_err(|error| PrView::GitError(error.to_string()))?;
+    let (base, head, base_ref) = match target.forge() {
+        crate::git::Forge::GitHub => {
+            github_revision_ids(repo, target, number, cancelled).map_err(PrView::from)
+        }
+        crate::git::Forge::GitLab => crate::gitlab::revision_ids(repo, target, number, cancelled),
+        crate::git::Forge::AzureDevOps => {
+            crate::azure_devops::revision_ids(repo, target, number, cancelled)
+        }
+    }?;
+    if base != revision.base_oid
+        || head != revision.head_oid
+        || base_ref != details.snapshot.base_ref
+    {
+        return Err(PrView::Error(
+            target.forge(),
+            "PR revision changed while loading. Open it again to review the new revision.".into(),
+        ));
+    }
+    Ok(PreparedPr { repository: target.clone(), snapshot: details.snapshot, revision })
+}
+
+pub fn parse_pr_number(target: &crate::git::RepoTarget, input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let number = input.strip_prefix(['#', '!']).unwrap_or(input);
+    if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return number
+            .parse()
+            .ok()
+            .filter(|number| *number > 0)
+            .ok_or_else(|| "Enter a positive PR number".into());
+    }
+    let url = input
+        .strip_prefix("https://")
+        .or_else(|| input.strip_prefix("http://"))
+        .ok_or_else(|| "Enter a PR URL or number".to_string())?;
+    let (host, path) = url.split_once('/').ok_or_else(|| "Enter a complete PR URL".to_string())?;
+    let path = path.split(['?', '#']).next().unwrap_or_default().trim_end_matches('/');
+    let marker = match target.forge() {
+        crate::git::Forge::GitHub => "/pull/",
+        crate::git::Forge::GitLab => "/-/merge_requests/",
+        crate::git::Forge::AzureDevOps => "/pullrequest/",
+    };
+    let (repository, tail) =
+        path.split_once(marker).ok_or_else(|| format!("Enter a {} URL", target.forge().noun()))?;
+    if !target.matches_url(&format!("https://{host}/{repository}")) {
+        return Err(format!("Choose a PR in {}", target.full_path()));
+    }
+    let number = tail.split('/').next().unwrap_or_default();
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("The PR URL must include a positive PR number".into());
+    }
+    number
+        .parse()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| "The PR URL must include a positive PR number".into())
 }
 
 /// The PR lifecycle.
@@ -554,6 +694,114 @@ fn pin_outcome(read: Result<Option<PrView>, GhError>) -> Result<Option<PrView>, 
     }
 }
 
+fn github_open_prs(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PrSummary>, GhError> {
+    let query = "query($o:String!,$n:String!,$after:String){repository(owner:$o,name:$n){pullRequests(states:OPEN,first:100,after:$after,orderBy:{field:CREATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor} nodes{number title url headRefName baseRefName isDraft}}}}";
+    collect_github_prs(|after| {
+        let mut vars =
+            vec![("o".into(), target.owner().to_string()), ("n".into(), target.name().to_string())];
+        if let Some(cursor) = after {
+            vars.push(("after".into(), cursor.to_string()));
+        }
+        graphql(repo, target.host(), query, &vars, cancelled)
+    })
+}
+
+fn collect_github_prs(
+    mut read: impl FnMut(Option<&str>) -> Result<Value, GhError>,
+) -> Result<Vec<PrSummary>, GhError> {
+    let mut rows = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = read(after.as_deref())?;
+        let connection = &page["data"]["repository"]["pullRequests"];
+        let nodes = connection["nodes"]
+            .as_array()
+            .ok_or_else(|| GhError::Other("Open PR list is unavailable".into()))?;
+        for node in nodes {
+            rows.push(PrSummary {
+                number: node["number"]
+                    .as_u64()
+                    .ok_or_else(|| GhError::Other("PR list row has no number".into()))?,
+                title: node["title"].as_str().unwrap_or_default().to_string(),
+                url: node["url"].as_str().unwrap_or_default().to_string(),
+                head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
+                base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
+                is_draft: node["isDraft"].as_bool().unwrap_or(false),
+            });
+        }
+        if connection["pageInfo"]["hasNextPage"].as_bool() == Some(false) {
+            return Ok(rows);
+        }
+        let next = connection["pageInfo"]["endCursor"]
+            .as_str()
+            .filter(|cursor| !cursor.is_empty())
+            .ok_or_else(|| GhError::Other("Open PR list returned an incomplete page".into()))?;
+        if after.as_deref() == Some(next) {
+            return Err(GhError::Other("Open PR list did not advance to its next page".into()));
+        }
+        after = Some(next.to_string());
+    }
+}
+
+fn github_pr_details(
+    repo: &Path,
+    detail_repo: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<PrDetails, GhError> {
+    let target = FetchTarget {
+        repo,
+        host: detail_repo.host(),
+        owner: detail_repo.owner(),
+        name: detail_repo.name(),
+        cancelled,
+    };
+    let mut detail = pr_detail(&target, number)?;
+    complete_review_thread_comments(&target, &mut detail)?;
+    let node = &detail["data"]["repository"]["pullRequest"];
+    if node.is_null() {
+        return Err(GhError::NotFound(format!(
+            "PR #{number} was not found in {}",
+            detail_repo.full_path()
+        )));
+    }
+    Ok(PrDetails {
+        snapshot: build_snapshot(node, Sync::InSync),
+        base_oid: node["baseRefOid"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
+fn github_revision_ids(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<(String, String, String), GhError> {
+    let query = format!(
+        "query($o:String!,$n:String!){{repository(owner:$o,name:$n){{pullRequest(number:{number}){{baseRefOid headRefOid baseRefName}}}}}}"
+    );
+    let detail = graphql(
+        repo,
+        target.host(),
+        &query,
+        &[("o".into(), target.owner().to_string()), ("n".into(), target.name().to_string())],
+        cancelled,
+    )?;
+    let node = &detail["data"]["repository"]["pullRequest"];
+    if node.is_null() {
+        return Err(GhError::NotFound(format!("PR #{number} is no longer available")));
+    }
+    Ok((
+        node["baseRefOid"].as_str().unwrap_or_default().to_string(),
+        node["headRefOid"].as_str().unwrap_or_default().to_string(),
+        node["baseRefName"].as_str().unwrap_or_default().to_string(),
+    ))
+}
+
 /// Read one pull request's full snapshot. `None` when the forge reports no such PR.
 fn read_pr(
     repo: &Path,
@@ -860,7 +1108,7 @@ fn build_detail_query(number: u64) -> String {
         "query($o:String!,$n:String!){{repository(owner:$o,name:$n){{\
          pullRequest(number:{number}){{\
          number title url body isDraft state mergeable mergeStateStatus baseRefName headRefName \
-         headRefOid isCrossRepository \
+         baseRefOid headRefOid isCrossRepository \
          commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{pageInfo{{hasNextPage}} nodes{{__typename \
          ... on CheckRun{{name status conclusion}} ... on StatusContext{{context state}}}}}}}}}}}}}} \
          reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body submittedAt}}}} \
@@ -1293,6 +1541,117 @@ pub(crate) fn parse_iso(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_pr_inputs_are_bound_to_the_current_repository() {
+        let github = crate::git::RepoTarget::new("github.com", "owner", "repo").unwrap();
+        for input in
+            ["42", " #42 ", "https://github.com/OWNER/REPO/pull/42/files?diff=split#review"]
+        {
+            assert_eq!(parse_pr_number(&github, input), Ok(42), "{input}");
+        }
+        for input in [
+            "0",
+            "#0",
+            "-42",
+            "https://github.com/other/repo/pull/42",
+            "https://example.com/owner/repo/pull/42",
+            "https://github.com/owner/repo/issues/42",
+            "https://github.com@other.example/owner/repo/pull/42",
+            "https://github.com/owner/repo/pull/+42",
+        ] {
+            assert!(parse_pr_number(&github, input).is_err(), "{input}");
+        }
+        let gitlab = crate::git::RepoTarget::with_path(
+            crate::git::Forge::GitLab,
+            "git.corp.example",
+            &["group", "subgroup", "repo"],
+        )
+        .unwrap();
+        assert_eq!(
+            parse_pr_number(
+                &gitlab,
+                "https://git.corp.example/group/subgroup/repo/-/merge_requests/7"
+            ),
+            Ok(7)
+        );
+        assert_eq!(parse_pr_number(&gitlab, "!7"), Ok(7));
+        let azure = crate::git::RepoTarget::with_path(
+            crate::git::Forge::AzureDevOps,
+            "dev.azure.com",
+            &["org", "My Project", "repo"],
+        )
+        .unwrap();
+        assert_eq!(
+            parse_pr_number(
+                &azure,
+                "https://dev.azure.com/org/My%20Project/_git/repo/pullrequest/8"
+            ),
+            Ok(8)
+        );
+        assert_eq!(
+            parse_pr_number(
+                &azure,
+                "https://org.visualstudio.com/My%20Project/_git/repo/pullrequest/8"
+            ),
+            Ok(8)
+        );
+        assert_eq!(
+            parse_pr_number(
+                &azure,
+                "https://ORG.VISUALSTUDIO.COM/DefaultCollection/My%20Project/_git/repo/pullrequest/8"
+            ),
+            Ok(8)
+        );
+        assert!(
+            parse_pr_number(
+                &azure,
+                "https://other.visualstudio.com/My%20Project/_git/repo/pullrequest/8"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_pr_number(
+                &azure,
+                "https://dev.azure.com/org/My%ZZProject/_git/repo/pullrequest/8"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn open_pr_list_reads_every_cursor_page_and_keeps_drafts() {
+        let row = |number, draft| serde_json::json!({"number":number,"title":format!("PR {number}"),"isDraft":draft});
+        let first: Vec<_> = (1..=100).map(|number| row(number, false)).collect();
+        let pages = [
+            serde_json::json!({"data":{"repository":{"pullRequests":{"nodes":first,"pageInfo":{"hasNextPage":true,"endCursor":"second"}}}}}),
+            serde_json::json!({"data":{"repository":{"pullRequests":{"nodes":[row(101,true)],"pageInfo":{"hasNextPage":false,"endCursor":"last"}}}}}),
+        ];
+        let mut calls = 0;
+        let rows = collect_github_prs(|after| {
+            assert_eq!(after, if calls == 0 { None } else { Some("second") });
+            let page = pages[calls].clone();
+            calls += 1;
+            Ok(page)
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(rows.len(), 101);
+        assert!(rows.last().unwrap().is_draft);
+        assert_eq!(rows.last().unwrap().number, 101);
+    }
+
+    #[test]
+    fn incomplete_or_failed_pr_pages_never_return_a_partial_list() {
+        let page = |cursor: Value| serde_json::json!({"data":{"repository":{"pullRequests":{"nodes":[{"number":1}],"pageInfo":{"hasNextPage":true,"endCursor":cursor}}}}});
+        assert!(collect_github_prs(|_| Ok(page(Value::Null))).is_err());
+        assert!(collect_github_prs(|_| Ok(page(Value::String("same".into())))).is_err());
+        let result = collect_github_prs(|after| match after {
+            None => Ok(page(Value::String("next".into()))),
+            Some(_) => Err(GhError::Other("offline".into())),
+        });
+        assert_eq!(result, Err(GhError::Other("offline".into())));
+    }
 
     #[test]
     fn merge_surfaces_only_conflicts_and_blocked() {

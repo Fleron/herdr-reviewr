@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicBool;
 use serde_json::Value;
 
 use crate::forge::{
-    AssocPr, Association, Check, CheckStatus, Comment, CommentKind, Merge, PrFetchInput,
-    PrSnapshot, PrState, PrView, Reply, Sync, finish_comments, prose_row, push_unique,
+    AssocPr, Association, Check, CheckStatus, Comment, CommentKind, Merge, PrDetails, PrFetchInput,
+    PrSnapshot, PrState, PrSummary, PrView, Reply, Sync, finish_comments, prose_row, push_unique,
     upsert_latest,
 };
 
@@ -163,6 +163,107 @@ fn classify_failure(stderr: &str) -> GlabError {
     }
 }
 
+pub(crate) fn list_open_prs(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PrSummary>, PrView> {
+    let project = crate::forge::urlencode(&target.full_path());
+    collect_open_mrs(|page| glab_api(repo, target.host(), &format!("projects/{project}/merge_requests?state=opened&scope=all&order_by=created_at&sort=desc&per_page=100&page={page}"), cancelled))
+        .map_err(|error| error.into_view(target.host()))
+}
+
+fn collect_open_mrs(
+    mut read: impl FnMut(u64) -> Result<Value, GlabError>,
+) -> Result<Vec<PrSummary>, GlabError> {
+    let mut rows = Vec::new();
+    let mut page = 1_u64;
+    loop {
+        let response = read(page)?;
+        let nodes = response
+            .as_array()
+            .ok_or_else(|| GlabError::Other("Open MR list is unavailable".into()))?;
+        if nodes.is_empty() {
+            return Ok(rows);
+        }
+        for node in nodes {
+            rows.push(PrSummary {
+                number: node["iid"]
+                    .as_u64()
+                    .ok_or_else(|| GlabError::Other("MR list row has no number".into()))?,
+                title: node["title"].as_str().unwrap_or_default().to_string(),
+                url: node["web_url"].as_str().unwrap_or_default().to_string(),
+                head_ref: node["source_branch"].as_str().unwrap_or_default().to_string(),
+                base_ref: node["target_branch"].as_str().unwrap_or_default().to_string(),
+                is_draft: node["draft"].as_bool().unwrap_or(false),
+            });
+        }
+        page += 1;
+    }
+}
+
+pub(crate) fn pr_details(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<PrDetails, PrView> {
+    let read = || {
+        let (mr, base_oid) = read_target(repo, target, number, cancelled)?;
+        Ok(PrDetails {
+            base_oid,
+            snapshot: snapshot_for(repo, target, number, &mr, Sync::InSync, cancelled)?,
+        })
+    };
+    read().map_err(|error: GlabError| error.into_view(target.host()))
+}
+
+pub(crate) fn revision_ids(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<(String, String, String), PrView> {
+    read_target(repo, target, number, cancelled)
+        .map(|(mr, base)| {
+            (
+                base,
+                mr["sha"].as_str().unwrap_or_default().to_string(),
+                mr["target_branch"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .map_err(|error| error.into_view(target.host()))
+}
+
+fn read_target(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<(Value, String), GlabError> {
+    let mr = read_mr(repo, target, number, cancelled)?.ok_or_else(|| {
+        GlabError::Unavailable(format!("MR !{number} was not found in {}", target.full_path()))
+    })?;
+    let project = crate::forge::urlencode(&target.full_path());
+    let branch = mr["target_branch"]
+        .as_str()
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| GlabError::Other("MR target branch is unavailable".into()))?;
+    let branch = crate::forge::urlencode(branch);
+    let base = glab_api(
+        repo,
+        target.host(),
+        &format!("projects/{project}/repository/branches/{branch}"),
+        cancelled,
+    )?;
+    let base_oid = base["commit"]["id"]
+        .as_str()
+        .filter(|oid| !oid.is_empty())
+        .ok_or_else(|| GlabError::Other("MR target branch commit is unavailable".into()))?
+        .to_string();
+    Ok((mr, base_oid))
+}
+
 fn fetch_inner(
     repo: &Path,
     input: &PrFetchInput,
@@ -183,13 +284,23 @@ fn fetch_inner(
         };
         (mr, iid, project)
     };
-    let host = project.host();
-    let project_path = crate::forge::urlencode(&project.full_path());
-    // Against the pinned HEAD, so a mid-fetch checkout never mixes two branches.
     let mr_head = mr["sha"].as_str().unwrap_or_default();
     let sync = crate::forge::local_sync(repo, input.local.head_oid.as_deref(), mr_head)
         .map_err(|error| GlabError::LocalGit(error.0))?;
+    snapshot_for(repo, project, iid, &mr, sync, cancelled)
+        .map(|snapshot| PrView::Pr(Box::new(snapshot)))
+}
 
+fn snapshot_for(
+    repo: &Path,
+    project: &crate::git::RepoTarget,
+    iid: u64,
+    mr: &Value,
+    sync: Sync,
+    cancelled: &AtomicBool,
+) -> Result<PrSnapshot, GlabError> {
+    let host = project.host();
+    let project_path = crate::forge::urlencode(&project.full_path());
     // The three surfaces read concurrently.
     let target_path = project_path.as_str();
     let (discussions, approvals, checks) = std::thread::scope(|scope| {
@@ -203,7 +314,7 @@ fn fetch_inner(
                 cancelled,
             ))
         });
-        let checks = scope.spawn(|| fetch_checks(repo, host, target_path, &mr, cancelled));
+        let checks = scope.spawn(|| fetch_checks(repo, host, target_path, mr, cancelled));
         (
             crate::forge::join_read(discussions, || died("discussions")),
             crate::forge::join_read(approvals, || died("approvals")),
@@ -214,15 +325,7 @@ fn fetch_inner(
     let approvals = approvals?;
     let (checks, jobs_capped) = checks?;
 
-    Ok(PrView::Pr(Box::new(build_snapshot(
-        &mr,
-        sync,
-        checks,
-        &rows,
-        &approvals,
-        discussions_capped,
-        jobs_capped,
-    ))))
+    Ok(build_snapshot(mr, sync, checks, &rows, &approvals, discussions_capped, jobs_capped))
 }
 
 /// The newest comment discussions, from the last two pages: GitLab lists oldest first.
@@ -759,6 +862,33 @@ fn is_access_token_bot(username: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_mr_pages_are_complete_without_pagination_headers() {
+        let mut calls = Vec::new();
+        let rows = collect_open_mrs(|page| {
+            calls.push(page);
+            Ok(match page {
+                1 => Value::Array((1..=100).map(|iid| serde_json::json!({"iid":iid})).collect()),
+                2 => serde_json::json!([{"iid":101,"draft":true}]),
+                3 => serde_json::json!([]),
+                _ => panic!("unexpected page {page}"),
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, [1, 2, 3]);
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows.last().unwrap().number, 101);
+        assert!(rows.last().unwrap().is_draft);
+        assert!(collect_open_mrs(|_| Ok(Value::Null)).is_err());
+        assert!(
+            collect_open_mrs(|page| match page {
+                1 => Ok(serde_json::json!([{"iid":1}])),
+                _ => Err(GlabError::Other("offline".into())),
+            })
+            .is_err()
+        );
+    }
     use serde_json::json;
 
     fn mr_node() -> Value {

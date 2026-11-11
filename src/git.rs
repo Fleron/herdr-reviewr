@@ -304,6 +304,15 @@ impl RepoTarget {
             && self.path.iter().zip(&other.path).all(|(a, b)| a.eq_ignore_ascii_case(b))
     }
 
+    pub fn matches_url(&self, url: &str) -> bool {
+        let hosts = ForgeHosts {
+            github: (self.forge == Forge::GitHub).then_some(self.host()),
+            gitlab: (self.forge == Forge::GitLab).then_some(self.host()),
+            azure_devops: (self.forge == Forge::AzureDevOps).then_some(self.host()),
+        };
+        matches!(classify_remote(url, &hosts, ssh_hostname), RepositoryIdentity::Repository(target) if self.is(&target))
+    }
+
     /// The second path segment: Azure DevOps' project.
     pub fn project(&self) -> &str {
         &self.path[1]
@@ -556,6 +565,105 @@ pub struct PrFetchInput {
     pub origin_repository: Option<RepoTarget>,
     /// The locally derived pins and published heads, read in the same pass.
     pub local: PrLocalState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrRevision {
+    pub base_oid: String,
+    pub head_oid: String,
+    pub merge_base_oid: String,
+}
+
+pub fn fetch_pr_revision(
+    repo: &Path,
+    target: &RepoTarget,
+    number: u64,
+    base_oid: &str,
+    head_oid: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<PrRevision> {
+    anyhow::ensure!(!cancelled.load(std::sync::atomic::Ordering::Acquire), "PR load cancelled");
+    anyhow::ensure!(
+        [base_oid, head_oid].into_iter().all(|oid| {
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())
+        }),
+        "PR has an invalid commit ID"
+    );
+    let hosts = match target.forge() {
+        Forge::GitHub => ForgeHosts { github: Some(target.host()), ..ForgeHosts::default() },
+        Forge::GitLab => ForgeHosts { gitlab: Some(target.host()), ..ForgeHosts::default() },
+        Forge::AzureDevOps => {
+            ForgeHosts { azure_devops: Some(target.host()), ..ForgeHosts::default() }
+        }
+    };
+    let mut remote = None;
+    for name in git(repo, &["remote"])?.lines() {
+        let raw = git(repo, &["config", "--get", &format!("remote.{name}.url")])?;
+        let identity = classify_remote(raw.trim(), &hosts, ssh_hostname);
+        let expanded = remote_identity(repo, name, &hosts, ssh_hostname)?;
+        if [identity, expanded].iter().any(|identity| {
+            matches!(identity, RepositoryIdentity::Repository(found) if found.is(target))
+        }) {
+            remote = Some(name.to_string());
+            break;
+        }
+    }
+    let remote =
+        remote.ok_or_else(|| anyhow::anyhow!("No remote matches the selected PR repository"))?;
+    let fetch = |source: &str| -> Result<()> {
+        let mut command = git_command(repo);
+        command.args([
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "-c",
+            "gc.auto=0",
+            "fetch",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-prune",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--refmap=",
+            "--",
+            &remote,
+            source,
+        ]);
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        crate::proc::run_tree(command, || cancelled.load(std::sync::atomic::Ordering::Acquire))
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("PR objects could not be fetched: {error:?}"))
+    };
+    if !commit_exists(repo, base_oid) {
+        fetch(base_oid)?;
+    }
+    if !commit_exists(repo, head_oid)
+        && let Err(error) = fetch(head_oid)
+    {
+        let source = match target.forge() {
+            Forge::GitHub => format!("refs/pull/{number}/head"),
+            Forge::GitLab => format!("refs/merge-requests/{number}/head"),
+            // Azure exposes a merge ref; the requested source head is still verified below.
+            Forge::AzureDevOps => format!("refs/pull/{number}/merge"),
+        };
+        fetch(&source).map_err(|fallback| anyhow::anyhow!("{error}; {fallback}"))?;
+    }
+    anyhow::ensure!(
+        commit_exists(repo, base_oid) && commit_exists(repo, head_oid),
+        "The selected PR revision is unavailable"
+    );
+    anyhow::ensure!(!cancelled.load(std::sync::atomic::Ordering::Acquire), "PR load cancelled");
+    let merge_base_oid = git_strict(repo, &["merge-base", base_oid, head_oid])?.trim().to_string();
+    let session = session(repo)?;
+    let mut pins = session.pr_pins.lock().unwrap_or_else(PoisonError::into_inner);
+    if pins.is_none() {
+        *pins = Some(PrPins::new(repo)?);
+    }
+    let pins = pins.as_ref().expect("filled above");
+    let name = pins.dir.file_name().and_then(|name| name.to_str()).expect("generated name");
+    for oid in [base_oid, head_oid, &merge_base_oid] {
+        git(repo, &["update-ref", &format!("refs/worktree/reviewr/pr/{name}/{oid}"), oid])?;
+    }
+    Ok(PrRevision { base_oid: base_oid.into(), head_oid: head_oid.into(), merge_base_oid })
 }
 
 /// The local identity one PR fetch derives: the pins, the branch, and where its work lives.
@@ -1366,6 +1474,27 @@ pub fn diff_sides(
     path: &str,
     source: Option<&str>,
 ) -> Result<DiffSides> {
+    diff_sides_inner(repo, old, new, path, source, None)
+}
+
+pub fn diff_sides_at(
+    repo: &Path,
+    old: &str,
+    new: &str,
+    path: &str,
+    source: Option<&str>,
+) -> Result<DiffSides> {
+    diff_sides_inner(repo, old, Some(new), path, source, Some(new))
+}
+
+fn diff_sides_inner(
+    repo: &Path,
+    old: &str,
+    new: Option<&str>,
+    path: &str,
+    source: Option<&str>,
+    attributes: Option<&str>,
+) -> Result<DiffSides> {
     // Git before 2.50 overflows twice a wider context on Windows; a longer side opens too large.
     let context = format!("-U{}", crate::diff::MAX_LINES);
     let mut args = vec![
@@ -1395,7 +1524,11 @@ pub fn diff_sides(
     args.push("--");
     args.extend(source);
     args.push(path);
-    let out = git(repo, &args)?;
+    let mut command = git_command(repo);
+    if let Some(attributes) = attributes {
+        command.arg(format!("--attr-source={attributes}"));
+    }
+    let out = run(command, &args)?;
     let sections = sections(&out);
     // A pathspec matches below a directory of the same name too, so each side is its own section.
     let side = |name: &str, new_side: bool| -> Side {
@@ -1818,6 +1951,30 @@ pub fn under_or_eq(path: &str, dir: &str) -> bool {
 
 /// The prefix of every index copy's directory under [`copies_dir`].
 const COPY_PREFIX: &str = "index-";
+const PR_PINS_PREFIX: &str = "pr-";
+
+struct PrPins {
+    _live: std::fs::File,
+    dir: PathBuf,
+}
+
+impl PrPins {
+    fn new(repo: &Path) -> Result<Self> {
+        let home = copies_dir(repo)?;
+        match std::fs::create_dir(&home) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
+        let dir = tempfile::Builder::new().prefix(PR_PINS_PREFIX).tempdir_in(home)?;
+        let pending = dir.path().join("lock.new");
+        let live = std::fs::File::create(&pending)?;
+        live.lock()?;
+        std::fs::rename(pending, dir.path().join("lock"))?;
+        Ok(Self { _live: live, dir: dir.keep() })
+    }
+}
 
 /// Where `repo`'s index copies live: its own git dir, on disk beside the index they copy.
 fn copies_dir(repo: &Path) -> Result<PathBuf> {
@@ -1941,6 +2098,29 @@ pub fn sweep_dead_copies(repo: &Path) {
     let Ok(home) = copies_dir(repo) else { return };
     let Ok(entries) = std::fs::read_dir(home) else { return };
     for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(PR_PINS_PREFIX) {
+            let dir = entry.path();
+            let Ok(lock) = std::fs::File::open(dir.join("lock")) else { continue };
+            if lock.try_lock().is_err() {
+                continue;
+            }
+            let prefix =
+                format!("refs/worktree/reviewr/pr/{}/", entry.file_name().to_string_lossy());
+            let Ok(refs) = git(repo, &["for-each-ref", "--format=%(refname)", &prefix]) else {
+                continue;
+            };
+            let mut deletes = String::new();
+            for name in refs.lines() {
+                let _ = writeln!(deletes, "delete {name}");
+            }
+            if !deletes.is_empty() && git_stdin(repo, &["update-ref", "--stdin"], &deletes).is_err()
+            {
+                continue;
+            }
+            drop(lock);
+            let _ = std::fs::remove_dir_all(dir);
+            continue;
+        }
         if !entry.file_name().to_string_lossy().starts_with(COPY_PREFIX) {
             continue;
         }
@@ -1978,6 +2158,7 @@ struct RepoSession {
     /// The clone's common dir, canonical: the worktree picker lists from it.
     common_dir: PathBuf,
     copy: Mutex<Option<IndexCopy>>,
+    pr_pins: Mutex<Option<PrPins>>,
     /// Where the session copy's index file lives, so a snapshot seeds from it without its lock.
     copy_file: Mutex<Option<PathBuf>>,
     counts: Mutex<Arc<Counts>>,
@@ -2092,6 +2273,12 @@ pub fn changed_from_in(repo: &Path, base: &str, paths: &[String]) -> Result<Vec<
 /// The changeset between two trees: `commits`, and `last-turn` against its snapshot.
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
     assemble(repo, &git(repo, &diff_args(&[old, new]))?, false, None)
+}
+
+pub fn changed_between_at(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
+    let mut command = git_command(repo);
+    command.arg(format!("--attr-source={new}"));
+    assemble(repo, &run(command, &diff_args(&[old, new]))?, false, None)
 }
 
 /// [`changed_between`] limited to `paths`.
@@ -2271,6 +2458,55 @@ pub struct WorktreeEntry {
     pub path: String,
     pub ignored: bool,
     pub is_dir: bool,
+}
+
+pub fn files_at(repo: &Path, commit: &str) -> Result<Vec<WorktreeEntry>> {
+    let listed = git(repo, &["ls-tree", "-rz", "--full-tree", commit, "--"])?;
+    let mut entries = Vec::new();
+    for row in listed.split('\0').filter(|row| !row.is_empty()) {
+        let (_, path) =
+            row.split_once('\t').ok_or_else(|| anyhow::anyhow!("Invalid Git tree entry"))?;
+        entries.push(WorktreeEntry { path: path.into(), ignored: false, is_dir: false });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+pub fn content_at(repo: &Path, commit: &str, path: &str) -> Result<Vec<u8>, crate::diff::Notice> {
+    use crate::diff::Notice;
+    let listed =
+        git(repo, &["--literal-pathspecs", "ls-tree", "-lz", "--full-tree", commit, "--", path])
+            .map_err(|_| Notice::Unreadable)?;
+    let row = listed
+        .split('\0')
+        .find_map(|row| {
+            let (metadata, name) = row.split_once('\t')?;
+            (name == path).then_some(metadata)
+        })
+        .ok_or(Notice::Unreadable)?;
+    let mut fields = row.split_whitespace();
+    let mode = fields.next().ok_or(Notice::Unreadable)?;
+    let kind = fields.next().ok_or(Notice::Unreadable)?;
+    let oid = fields.next().ok_or(Notice::Unreadable)?;
+    if mode == "160000" && kind == "commit" {
+        return Ok(format!("Subproject commit {oid}\n").into_bytes());
+    }
+    if kind != "blob" {
+        return Err(Notice::Unreadable);
+    }
+    let size =
+        fields.next().and_then(|size| size.parse::<usize>().ok()).ok_or(Notice::Unreadable)?;
+    if crate::diff::over_byte_budget(size) {
+        return Err(Notice::TooLarge);
+    }
+    let output = run_git(repo, &["cat-file", "blob", oid]).map_err(|_| Notice::Unreadable)?;
+    if !output.status.success() {
+        return Err(Notice::Unreadable);
+    }
+    if output.stdout.contains(&0) {
+        return Err(Notice::Binary);
+    }
+    Ok(output.stdout)
 }
 
 /// Every worktree entry, sorted; an ignored directory collapses to one placeholder.

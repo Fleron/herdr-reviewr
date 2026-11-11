@@ -41,6 +41,7 @@ fn changed_against_tree(repo: &Path, tree: &str) -> anyhow::Result<Vec<ChangedFi
 fn world_input(repo: &Path, scope: Scope, base: Option<&str>, turn: Option<&str>) -> WorldInput {
     WorldInput {
         repo: repo.to_path_buf(),
+        pr_revision: None,
         tab: herdr_reviewr::app::Tab::Changes,
         scope,
         base: base.map(str::to_string),
@@ -54,6 +55,255 @@ fn world_input(repo: &Path, scope: Scope, base: Option<&str>, turn: Option<&str>
 fn merge_base(repo: &Path, base: Option<&str>) -> Option<String> {
     let winner = resolve_base(repo, base).ok()?.status.winner?;
     merge_base_oid(repo, winner.oid())
+}
+
+fn pr_remote() -> (Repo, Repo, String, String) {
+    let source = Repo::init();
+    source.write("shared.txt", "base\n");
+    source.commit_all("base");
+    let base = source.git(&["rev-parse", "HEAD"]).trim().to_string();
+    let local = Repo::init();
+    local.git(&["remote", "add", "origin", "https://github.com/example/project.git"]);
+    local.git(&[
+        "config",
+        &format!("url.{}.insteadOf", source.path().display()),
+        "https://github.com/example/project.git",
+    ]);
+    local.git(&["fetch", "origin", &base]);
+    local.git(&["checkout", "-B", "main", &base]);
+    source.git(&["checkout", "-b", "feature"]);
+    source.write("shared.txt", "PR\n");
+    source.write("only-in-pr.txt", "review this\n");
+    source.commit_all("PR revision");
+    let head = source.git(&["rev-parse", "HEAD"]).trim().to_string();
+    source.git(&["tag", "pr-tag", &head]);
+    (source, local, base, head)
+}
+
+fn pr_target(owner: &str) -> herdr_reviewr::git::RepoTarget {
+    let repo = Repo::init();
+    repo.git(&["remote", "add", "origin", &format!("https://github.com/{owner}/project.git")]);
+    let input = herdr_reviewr::forge::fetch_input(
+        repo.path(),
+        None,
+        &herdr_reviewr::config::PluginConfig::default(),
+    )
+    .unwrap();
+    let herdr_reviewr::git::RepositoryIdentity::Repository(target) = input.repository else {
+        panic!("repository target")
+    };
+    target
+}
+
+#[test]
+fn pr_fetch_preserves_checkout_dirty_files_index_and_public_refs() {
+    let (_source, local, base, head) = pr_remote();
+    local.write("shared.txt", "staged\n");
+    local.git(&["add", "shared.txt"]);
+    local.write("shared.txt", "unstaged\n");
+    local.write("untracked.txt", "local only\n");
+    local.git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    let git_dir = local.path().join(".git");
+    let index = std::fs::read(git_dir.join("index")).unwrap();
+    let fetch_head = std::fs::read(git_dir.join("FETCH_HEAD")).unwrap();
+    let public_refs = local.git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads",
+        "refs/remotes",
+        "refs/tags",
+    ]);
+    let revision = herdr_reviewr::git::fetch_pr_revision(
+        local.path(),
+        &pr_target("example"),
+        42,
+        &base,
+        &head,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(git_dir.join("index")).unwrap(), index);
+    assert_eq!(std::fs::read(git_dir.join("FETCH_HEAD")).unwrap(), fetch_head);
+    assert_eq!(
+        local.git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags"
+        ]),
+        public_refs
+    );
+    assert_eq!(local.git(&["rev-parse", "HEAD"]).trim(), base);
+    assert_eq!(local.git(&["symbolic-ref", "--short", "HEAD"]).trim(), "main");
+    assert_eq!(std::fs::read_to_string(local.path().join("shared.txt")).unwrap(), "unstaged\n");
+    assert_eq!(
+        std::fs::read_to_string(local.path().join("untracked.txt")).unwrap(),
+        "local only\n"
+    );
+    assert!(!local.path().join("only-in-pr.txt").exists());
+    assert_eq!(revision.head_oid, head);
+    assert_eq!(revision.merge_base_oid, base);
+    assert_eq!(herdr_reviewr::git::content_at(local.path(), &head, "shared.txt").unwrap(), b"PR\n");
+    assert_eq!(
+        herdr_reviewr::git::files_at(local.path(), &head)
+            .unwrap()
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        ["only-in-pr.txt", "shared.txt"]
+    );
+    local.git(&["reflog", "expire", "--expire=now", "--all"]);
+    local.git(&["gc", "--prune=now"]);
+    assert_eq!(
+        herdr_reviewr::git::content_at(local.path(), &head, "only-in-pr.txt").unwrap(),
+        b"review this\n"
+    );
+}
+
+#[test]
+fn pr_fetch_rejects_wrong_repository_and_missing_revision_without_local_fallback() {
+    let (_source, local, base, head) = pr_remote();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        herdr_reviewr::git::fetch_pr_revision(
+            local.path(),
+            &pr_target("other"),
+            42,
+            &base,
+            &head,
+            &cancelled,
+        )
+        .is_err()
+    );
+    assert!(
+        herdr_reviewr::git::fetch_pr_revision(
+            local.path(),
+            &pr_target("example"),
+            42,
+            &base,
+            &"1".repeat(40),
+            &cancelled,
+        )
+        .is_err()
+    );
+    assert_eq!(local.git(&["rev-parse", "HEAD"]).trim(), base);
+    assert!(herdr_reviewr::git::content_at(local.path(), &head, "shared.txt").is_err());
+}
+
+#[test]
+fn pinned_pr_objects_survive_live_leases_and_are_collectible_after_session_cleanup() {
+    let (_source, local, base, head) = pr_remote();
+    let first = herdr_reviewr::git::lease_session(local.path());
+    let second = herdr_reviewr::git::lease_session(local.path());
+    herdr_reviewr::git::fetch_pr_revision(
+        local.path(),
+        &pr_target("example"),
+        42,
+        &base,
+        &head,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    drop(first);
+    herdr_reviewr::git::sweep_dead_copies(local.path());
+    local.git(&["reflog", "expire", "--expire=now", "--all"]);
+    local.git(&["gc", "--prune=now"]);
+    assert_eq!(
+        herdr_reviewr::git::content_at(local.path(), &head, "only-in-pr.txt").unwrap(),
+        b"review this\n"
+    );
+    drop(second);
+    herdr_reviewr::git::sweep_dead_copies(local.path());
+    local.git(&["gc", "--prune=now"]);
+    assert!(herdr_reviewr::git::content_at(local.path(), &head, "only-in-pr.txt").is_err());
+}
+
+#[test]
+fn pr_comparisons_use_pinned_attributes_instead_of_local_attributes() {
+    let repo = Repo::init();
+    repo.write("file.txt", "base\n");
+    repo.write(".gitattributes", "*.txt diff\n");
+    repo.commit_all("base");
+    let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    repo.write("file.txt", "head\n");
+    repo.commit_all("head");
+    let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    repo.git(&["checkout", "--detach", &base]);
+    repo.write(".gitattributes", "*.txt -diff\n");
+    assert!(herdr_reviewr::git::changed_between(repo.path(), &base, &head).unwrap()[0].binary);
+    let changed = herdr_reviewr::git::changed_between_at(repo.path(), &base, &head).unwrap();
+    assert!(!changed[0].binary);
+    assert_eq!((changed[0].additions, changed[0].deletions), (1, 1));
+    assert_eq!(
+        herdr_reviewr::git::diff_sides_at(repo.path(), &base, &head, "file.txt", None).unwrap(),
+        DiffSides::Text { old: "base\n".into(), new: "head\n".into() }
+    );
+    let mut input = world_input(repo.path(), Scope::Uncommitted, None, None);
+    input.pr_revision = Some(herdr_reviewr::git::PrRevision {
+        base_oid: base.clone(),
+        head_oid: head.clone(),
+        merge_base_oid: base,
+    });
+    let world = herdr_reviewr::world::build(&input).unwrap();
+    assert!(!world.changeset.files["file.txt"].binary);
+    assert_eq!(herdr_reviewr::git::content_at(repo.path(), &head, "file.txt").unwrap(), b"head\n");
+}
+
+#[test]
+fn commit_content_reads_literal_paths_binary_and_large_blobs() {
+    let repo = Repo::init();
+    let unusual = if cfg!(windows) { "literal[1].txt" } else { "tab\tline\n[1].txt" };
+    repo.write(unusual, "committed\n");
+    std::fs::write(repo.path().join("binary"), [0, 1, 2]).unwrap();
+    std::fs::write(repo.path().join("large"), vec![b'x'; 2_000_001]).unwrap();
+    repo.commit_all("tree");
+    let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    repo.write(unusual, "local\n");
+    assert_eq!(
+        herdr_reviewr::git::content_at(repo.path(), &head, unusual).unwrap(),
+        b"committed\n"
+    );
+    assert!(
+        herdr_reviewr::git::files_at(repo.path(), &head)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.path == unusual)
+    );
+    assert_eq!(
+        herdr_reviewr::git::content_at(repo.path(), &head, "binary"),
+        Err(herdr_reviewr::diff::Notice::Binary)
+    );
+    assert_eq!(
+        herdr_reviewr::git::content_at(repo.path(), &head, "large"),
+        Err(herdr_reviewr::diff::Notice::TooLarge)
+    );
+    assert_eq!(
+        herdr_reviewr::git::content_at(repo.path(), &head, "missing"),
+        Err(herdr_reviewr::diff::Notice::Unreadable)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_content_preserves_symlink_targets_and_gitlinks() {
+    let repo = Repo::init();
+    repo.write("file", "base\n");
+    repo.commit_all("base");
+    let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    std::os::unix::fs::symlink("outside-target", repo.path().join("link")).unwrap();
+    repo.git(&["update-index", "--add", "--cacheinfo", "160000", &base, "module"]);
+    repo.git(&["add", "link"]);
+    repo.git(&["commit", "-m", "special files"]);
+    let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        herdr_reviewr::git::content_at(repo.path(), &head, "link").unwrap(),
+        b"outside-target"
+    );
+    assert_eq!(
+        herdr_reviewr::git::content_at(repo.path(), &head, "module").unwrap(),
+        format!("Subproject commit {base}\n").as_bytes()
+    );
 }
 
 #[test]

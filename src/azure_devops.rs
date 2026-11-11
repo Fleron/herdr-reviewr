@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicBool;
 use serde_json::Value;
 
 use crate::forge::{
-    AssocPr, Association, Check, CheckStatus, Comment, CommentKind, Merge, PrFetchInput,
-    PrSnapshot, PrState, PrView, Reply, Sync, finish_comments, prose_row, push_unique,
+    AssocPr, Association, Check, CheckStatus, Comment, CommentKind, Merge, PrDetails, PrFetchInput,
+    PrSnapshot, PrState, PrSummary, PrView, Reply, Sync, finish_comments, prose_row, push_unique,
     upsert_latest,
 };
 
@@ -123,6 +123,164 @@ fn classify_failure(stderr: &str) -> AzError {
     }
 }
 
+pub(crate) fn list_open_prs(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PrSummary>, PrView> {
+    let org_url = organization_url(target);
+    collect_open_prs(target, &org_url, |skip| {
+        az_json(
+            repo,
+            &org_url,
+            &[
+                "repos",
+                "pr",
+                "list",
+                "--project",
+                target.project(),
+                "--repository",
+                target.name(),
+                "--status",
+                "active",
+                "--top",
+                "100",
+                "--skip",
+                &skip.to_string(),
+            ],
+            cancelled,
+        )
+    })
+    .map_err(|error| error.into_view(target.host()))
+}
+
+fn collect_open_prs(
+    target: &crate::git::RepoTarget,
+    org_url: &str,
+    mut read: impl FnMut(usize) -> Result<Value, AzError>,
+) -> Result<Vec<PrSummary>, AzError> {
+    let mut rows = Vec::new();
+    let mut skip = 0;
+    loop {
+        let response = read(skip)?;
+        let nodes = response
+            .as_array()
+            .ok_or_else(|| AzError::Other("Open PR list is unavailable".into()))?;
+        if nodes.is_empty() {
+            return Ok(rows);
+        }
+        skip += nodes.len();
+        for node in nodes {
+            let number = node["pullRequestId"]
+                .as_u64()
+                .ok_or_else(|| AzError::Other("PR list row has no number".into()))?;
+            rows.push(PrSummary {
+                number,
+                title: node["title"].as_str().unwrap_or_default().to_string(),
+                url: format!(
+                    "{org_url}/{}/_git/{}/pullrequest/{number}",
+                    crate::forge::urlencode(target.project()),
+                    crate::forge::urlencode(target.name())
+                ),
+                head_ref: head_ref_of(node),
+                base_ref: bare_ref(node["targetRefName"].as_str().unwrap_or_default()),
+                is_draft: node["isDraft"].as_bool().unwrap_or(false),
+            });
+        }
+    }
+}
+
+pub(crate) fn pr_details(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<PrDetails, PrView> {
+    let read = || {
+        let (pr, base_oid) = read_target(repo, target, number, cancelled)?;
+        Ok(PrDetails {
+            base_oid,
+            snapshot: snapshot_for(repo, target, &pr, Sync::InSync, cancelled)?,
+        })
+    };
+    read().map_err(|error: AzError| error.into_view(target.host()))
+}
+
+pub(crate) fn revision_ids(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<(String, String, String), PrView> {
+    read_target(repo, target, number, cancelled)
+        .map(|(pr, base)| {
+            (
+                base,
+                source_tip(&pr).to_string(),
+                bare_ref(pr["targetRefName"].as_str().unwrap_or_default()),
+            )
+        })
+        .map_err(|error| error.into_view(target.host()))
+}
+
+fn read_target(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> Result<(Value, String), AzError> {
+    let org_url = organization_url(target);
+    let pr = az_json(
+        repo,
+        &org_url,
+        &[
+            "devops",
+            "invoke",
+            "--area",
+            "git",
+            "--resource",
+            "pullRequests",
+            "--route-parameters",
+            &format!("project={}", target.project()),
+            &format!("repositoryId={}", target.name()),
+            &format!("pullRequestId={number}"),
+            "--api-version",
+            "7.1",
+        ],
+        cancelled,
+    )?;
+    let branch = pr["targetRefName"]
+        .as_str()
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| AzError::Other("PR target branch is unavailable".into()))?;
+    let refs = az_json(
+        repo,
+        &org_url,
+        &[
+            "repos",
+            "ref",
+            "list",
+            "--project",
+            target.project(),
+            "--repository",
+            target.name(),
+            "--filter",
+            branch.strip_prefix("refs/").unwrap_or(branch),
+        ],
+        cancelled,
+    )?;
+    let base_oid = refs
+        .as_array()
+        .ok_or_else(|| AzError::Other("PR target branch refs are unavailable".into()))?
+        .iter()
+        .find(|reference| reference["name"].as_str() == Some(branch))
+        .and_then(|reference| reference["objectId"].as_str())
+        .filter(|oid| !oid.is_empty())
+        .ok_or_else(|| AzError::Other(format!("PR target branch {branch} is unavailable")))?
+        .to_string();
+    Ok((pr, base_oid))
+}
+
 fn fetch_inner(
     repo: &Path,
     input: &PrFetchInput,
@@ -130,11 +288,8 @@ fn fetch_inner(
     cancelled: &AtomicBool,
 ) -> Result<PrView, AzError> {
     let org_url = organization_url(target);
-    let project = target.project();
-    let repo_name = target.name();
-
     let head = input.local.head_oid.as_deref();
-    let (mut assoc, project_guid) = associate_by_branch(repo, &org_url, target, input, cancelled)?;
+    let (mut assoc, _) = associate_by_branch(repo, &org_url, target, input, cancelled)?;
     let Some(id) = crate::forge::resolve_pick(repo, &assoc, head)
         .map_err(|error| AzError::LocalGit(error.0))?
     else {
@@ -148,6 +303,26 @@ fn fetch_inner(
     let picked_tip = picked.as_ref().map(|pr| pr.head_oid.clone()).unwrap_or_default();
     let pr = picked.and_then(|pr| pr.raw.take()).unwrap_or(Value::Null);
 
+    let sync = crate::forge::local_sync(repo, input.local.head_oid.as_deref(), &picked_tip)
+        .map_err(|error| AzError::LocalGit(error.0))?;
+    snapshot_for(repo, target, &pr, sync, cancelled).map(|snapshot| PrView::Pr(Box::new(snapshot)))
+}
+
+fn snapshot_for(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    pr: &Value,
+    sync: Sync,
+    cancelled: &AtomicBool,
+) -> Result<PrSnapshot, AzError> {
+    let org_url = organization_url(target);
+    let project = target.project();
+    let repo_name = target.name();
+    let id = pr["pullRequestId"]
+        .as_u64()
+        .ok_or_else(|| AzError::Unavailable("PR details are unavailable".into()))?;
+    let project_guid = project_guid_of(pr);
+    let picked_tip = source_tip(pr);
     // One concurrent wave: each `az` pays its own startup, so waves are the latency.
     let (threads, evaluations, statuses) = std::thread::scope(|scope| {
         let threads = scope.spawn(|| {
@@ -216,18 +391,15 @@ fn fetch_inner(
     let evaluations = evaluations?;
     let statuses = statuses?;
     if pr["pullRequestId"].as_u64().is_none() {
-        return Ok(PrView::NoPr);
+        return Err(AzError::Unavailable("PR details are unavailable".into()));
     }
-    // Against the pinned HEAD, so a mid-fetch checkout never mixes two branches.
-    let sync = crate::forge::local_sync(repo, input.local.head_oid.as_deref(), &picked_tip)
-        .map_err(|error| AzError::LocalGit(error.0))?;
 
     let (rows, threads_capped) = newest_comment_threads(&threads);
     // A full page can hide older rows.
     let checks_capped = one_page_capped(&evaluations) || one_page_capped(&statuses);
     let checks = build_checks(&evaluations, &statuses);
-    Ok(PrView::Pr(Box::new(build_snapshot(
-        &pr,
+    Ok(build_snapshot(
+        pr,
         target,
         &org_url,
         sync,
@@ -236,7 +408,7 @@ fn fetch_inner(
         &evaluations,
         threads_capped,
         checks_capped,
-    ))))
+    ))
 }
 
 /// The pull request's policy evaluations, addressed by the project GUID.
@@ -679,6 +851,46 @@ fn is_azure_bot(identity: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_pr_pages_advance_by_returned_rows_and_keep_drafts() {
+        let target = crate::git::RepoTarget::with_path(
+            crate::git::Forge::AzureDevOps,
+            "dev.azure.com",
+            &["org", "project", "repo"],
+        )
+        .unwrap();
+        let org = organization_url(&target);
+        let mut calls = Vec::new();
+        let rows = collect_open_prs(&target, &org, |skip| {
+            calls.push(skip);
+            Ok(match skip {
+                0 => Value::Array(
+                    (1..=100).map(|id| serde_json::json!({"pullRequestId":id})).collect(),
+                ),
+                100 => serde_json::json!([{"pullRequestId":101,"isDraft":true}]),
+                101 => serde_json::json!([]),
+                _ => panic!("unexpected offset {skip}"),
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, [0, 100, 101]);
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows.last().unwrap().number, 101);
+        assert!(rows.last().unwrap().is_draft);
+        assert_eq!(
+            rows.last().unwrap().url,
+            "https://dev.azure.com/org/project/_git/repo/pullrequest/101"
+        );
+        assert!(collect_open_prs(&target, &org, |_| Ok(Value::Null)).is_err());
+        assert!(
+            collect_open_prs(&target, &org, |skip| match skip {
+                0 => Ok(serde_json::json!([{"pullRequestId":1}])),
+                _ => Err(AzError::Other("offline".into())),
+            })
+            .is_err()
+        );
+    }
     use serde_json::json;
 
     #[test]

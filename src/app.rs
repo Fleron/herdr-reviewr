@@ -1344,6 +1344,7 @@ impl App {
     pub fn world_input(&self) -> crate::world::WorldInput {
         crate::world::WorldInput {
             repo: self.repo.clone(),
+            pr_revision: None,
             tab: self.tab,
             scope: self.scope,
             base: self.base.clone(),

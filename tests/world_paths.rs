@@ -42,6 +42,52 @@ fn paths(list: &[&str]) -> Refresh {
     Refresh::paths(list.iter().map(|p| (*p).to_string()))
 }
 
+#[test]
+fn pinned_pr_world_uses_commit_trees_and_ignores_local_writes() {
+    let repo = Repo::init();
+    repo.write("file", "base\n");
+    repo.commit_all("base");
+    let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    repo.git(&["checkout", "-b", "feature"]);
+    repo.write("file", "PR\n");
+    repo.write("only-in-pr", "new\n");
+    repo.commit_all("PR");
+    let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    repo.git(&["checkout", "main"]);
+    repo.write("local-only", "local\n");
+    let mut input = input_for(&repo, Scope::Uncommitted, Tab::Changes);
+    input.pr_revision = Some(herdr_reviewr::git::PrRevision {
+        base_oid: base.clone(),
+        head_oid: head.clone(),
+        merge_base_oid: base,
+    });
+    let mut worker = Worker::on(&repo);
+    let (_, changed) = worker.run(&input, Refresh::Full);
+    let changed = changed.unwrap();
+    assert_eq!(changed.head.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        changed.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+        ["file", "only-in-pr"]
+    );
+    repo.write("file", "local edit\n");
+    assert!(worker.run(&input, paths(&["file"])).1.is_none());
+    input.tab = Tab::AllFiles;
+    let (_, files) = worker.run(&input, Refresh::Full);
+    let files = files.unwrap();
+    assert_eq!(
+        files.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+        ["file", "only-in-pr"]
+    );
+    assert!(
+        worker
+            .run(&input, Refresh::Paths { paths: ["file".to_string()].into(), index: true })
+            .1
+            .is_none()
+    );
+    input.pr_revision.as_mut().unwrap().head_oid = "1".repeat(40);
+    assert!(world::build(&input).is_err());
+}
+
 /// A repository with every kind of file a change can touch, and a feature branch off `main`.
 fn fixture() -> Repo {
     let r = Repo::init();

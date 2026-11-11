@@ -15,6 +15,7 @@ use crate::model::{ChangeKind, ChangedFile, CommitPick, Scope};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WorldInput {
     pub repo: PathBuf,
+    pub pr_revision: Option<git::PrRevision>,
     pub tab: Tab,
     pub scope: Scope,
     /// The `--base` flag. The pick is read at build time, so another pane's pick lands as content.
@@ -92,11 +93,20 @@ pub struct ScopeBuild {
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
     // Outside a repo, a file tab paints the quiet empty state, not an error every refresh.
     if input.tab.is_file_tab() && !git::is_repo(&input.repo) {
+        anyhow::ensure!(input.pr_revision.is_none(), "The selected PR repository is unavailable");
         return Ok(WorldSnapshot::default());
     }
     // One read of HEAD serves the snapshot, the footer, and the uncommitted diff's old end.
-    let (head, branch) = git::head_and_branch(&input.repo);
-    let checkout = git::checkout_name(branch, head.as_deref());
+    let (head, checkout) = if let Some(revision) = &input.pr_revision {
+        (
+            Some(revision.head_oid.clone()),
+            Some(format!("PR head {}", git::abbreviate_oid(&revision.head_oid))),
+        )
+    } else {
+        let (head, branch) = git::head_and_branch(&input.repo);
+        let checkout = git::checkout_name(branch, head.as_deref());
+        (head, checkout)
+    };
     if !input.tab.is_file_tab() {
         return Ok(WorldSnapshot { head, checkout, ..WorldSnapshot::default() });
     }
@@ -120,6 +130,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
 /// The active scope's changeset and, on `branch`, its base.
 pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
     if !git::is_repo(&input.repo) {
+        anyhow::ensure!(input.pr_revision.is_none(), "The selected PR repository is unavailable");
         return Ok(ScopeBuild::default());
     }
     scope_build(input, git::head_oid(&input.repo))
@@ -127,6 +138,23 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
 
 /// [`build_changed`] against `head`, as the caller read it, inside a repo.
 fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
+    if let Some(revision) = &input.pr_revision {
+        let files =
+            git::changed_between_at(&input.repo, &revision.merge_base_oid, &revision.head_oid)?
+                .into_iter()
+                .map(|file| (file.path.clone(), file))
+                .collect();
+        return Ok(ScopeBuild {
+            changeset: Changeset {
+                files,
+                ends: Some(DiffEnds {
+                    old: revision.merge_base_oid.clone(),
+                    new: Some(revision.head_oid.clone()),
+                }),
+            },
+            ..ScopeBuild::default()
+        });
+    }
     match input.scope {
         Scope::LastTurn => match input.turn_baseline.as_deref() {
             Some(t) => {
@@ -211,6 +239,12 @@ pub(crate) fn all_files_entries(
         let annotation = changed.get(&w.path).cloned();
         Entry::from_worktree(w, annotation)
     };
+    if let Some(revision) = &input.pr_revision {
+        return Ok(git::files_at(&input.repo, &revision.head_oid)?
+            .into_iter()
+            .map(&to_entry)
+            .collect());
+    }
     let mut entries: Vec<Entry> = git::all_files(&input.repo)?.into_iter().map(&to_entry).collect();
     let mut i = 0;
     while i < entries.len() {
@@ -523,7 +557,8 @@ impl Worker {
         mut refresh: Refresh,
     ) -> Option<Result<WorldSnapshot>> {
         // A pick reads committed trees: on `Changes`, a worktree or index change moves nothing in it.
-        let pick_only = input.scope == Scope::Commits && input.tab == Tab::Changes;
+        let pick_only = input.pr_revision.is_some()
+            || (input.scope == Scope::Commits && input.tab == Tab::Changes);
         if refresh.is_empty() || (pick_only && !refresh.is_full()) {
             return None;
         }
@@ -558,7 +593,9 @@ impl Worker {
                 None => {}
             }
         }
-        let fingerprint = fingerprint.unwrap_or_else(|| git::staged_fingerprint(&input.repo).ok());
+        let fingerprint = fingerprint.unwrap_or_else(|| {
+            input.pr_revision.is_none().then(|| git::staged_fingerprint(&input.repo).ok()).flatten()
+        });
         let built = build(input);
         match &built {
             Ok(built) => {
